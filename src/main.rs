@@ -2,6 +2,7 @@ mod audit;
 mod daemon;
 mod fs;
 mod launchd;
+mod mountpoint;
 mod paths;
 mod proto;
 mod secret;
@@ -143,19 +144,18 @@ fn resolve_profile(arg: &str) -> Result<(String, PathBuf)> {
 fn ensure_vault() -> Result<()> {
     if let Ok(resp) = call(&Request::Status, None) {
         // The mount point is fixed while the vault runs.
-        if std::env::var_os("RAMVAULT_MOUNT").is_some() {
-            let wanted = paths::mount_point()?;
-            if let Some(m) = resp.mount.filter(|m| *m != wanted) {
-                eprintln!(
-                    "ramvault: vault already mounted at {}; RAMVAULT_MOUNT={} applies after `ramvault lock`",
-                    m.display(),
-                    wanted.display()
-                );
-            }
+        let wanted = settings::load()?.mount;
+        if let Some(m) = resp.mount.filter(|m| *m != wanted) {
+            eprintln!(
+                "ramvault: vault already mounted at {}; mount point {} applies after `ramvault lock`",
+                m.display(),
+                wanted.display()
+            );
         }
         return Ok(());
     }
-    settings::load()?; // fail fast on a bad config instead of a vault that never starts
+    // Fail fast, with the reason, instead of a vault that never starts.
+    mountpoint::check(&settings::load()?.mount)?;
     let env: Vec<(String, String)> = ["RAMVAULT_FUSE_OPTIONS", "RAMVAULT_MOUNT"]
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))

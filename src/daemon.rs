@@ -40,25 +40,7 @@ pub fn serve() -> Result<()> {
     });
 
     let mount = crate::paths::mount_point()?;
-    if is_mounted(&mount) {
-        // Left behind by a vault that died without unmounting (killed, crashed).
-        let ok = std::process::Command::new("/sbin/umount")
-            .arg("-f")
-            .arg(&mount)
-            .status()
-            .is_ok_and(|s| s.success());
-        if !ok {
-            bail!(
-                "{} is still mounted from an earlier vault; run `umount -f {}`",
-                mount.display(),
-                mount.display()
-            );
-        }
-    }
-    match std::fs::create_dir(&mount) {
-        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e)?,
-        _ => std::fs::set_permissions(&mount, std::fs::Permissions::from_mode(0o700))?,
-    }
+    crate::mountpoint::prepare(&mount)?;
     let session = crate::fs::mount(shared.clone(), &mount, &fuse_options()).with_context(|| {
         format!(
             "mount {} (is macFUSE installed and its FSKit module enabled?)",

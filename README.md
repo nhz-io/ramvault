@@ -133,6 +133,11 @@ max = 86400             # seconds after unlock before a profile is dropped (at m
 | `max` | `RAMVAULT_MAX` | 86400 (also the cap) | `unlock` (per profile) |
 | | `RAMVAULT_FUSE_OPTIONS` | | the vault starts: extra macFUSE mount options, comma-separated |
 
+The mount point must be missing (created with mode 0700), an empty directory you own, or a dead
+ramvault mount (cleared). Anything else is refused before the vault starts, with the reason: a
+file, a symlink, a non-empty directory (its files would be hidden), a directory owned by someone
+else, or another filesystem already mounted there.
+
 ## Verified on panna (macOS 27.2, macFUSE 5.5.0)
 
 - Demo profile unlocks via launchd; `cat` reads it; `eval "$(ramvault env)"` points at it.
