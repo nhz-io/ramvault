@@ -32,9 +32,8 @@ pub fn mount(
     mountpoint: &std::path::Path,
     opts: &str,
 ) -> Result<std::thread::JoinHandle<()>> {
-    if SHARED.set(shared).is_err() {
-        bail!("already mounted");
-    }
+    // Set once; a retried mount reuses it.
+    let _ = SHARED.set(shared);
     let mp = CString::new(mountpoint.as_os_str().as_encoded_bytes())?;
     let opts = CString::new(opts)?;
     let rc = unsafe { rv_fuse_mount(mp.as_ptr(), opts.as_ptr()) };

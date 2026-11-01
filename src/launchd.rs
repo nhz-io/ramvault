@@ -1,6 +1,6 @@
-//! The vault runs as an on-demand LaunchAgent: `unlock` bootstraps it, the vault boots itself
-//! out when it exits. The plist lives outside ~/Library/LaunchAgents, so nothing starts at login
-//! and nothing runs while locked.
+//! The vault runs as an on-demand LaunchAgent: `unlock` bootstraps it (resetting the job the
+//! previous vault left loaded, not running), and the vault simply exits when done. The plist
+//! lives outside ~/Library/LaunchAgents, so nothing starts at login and nothing runs while locked.
 
 use anyhow::{Context, Result, bail};
 use std::path::Path;
@@ -57,11 +57,6 @@ pub fn plist(exe: &Path, stderr_log: &Path, env: &[(String, String)]) -> String 
 
 fn domain() -> String {
     format!("gui/{}", unsafe { libc::getuid() })
-}
-
-/// Did launchd start this process as our job?
-pub fn running_as_job() -> bool {
-    std::env::var("XPC_SERVICE_NAME").is_ok_and(|v| v == LABEL)
 }
 
 /// Writes the plist and starts the vault process.

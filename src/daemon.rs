@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 
 /// A vault with no profiles (e.g. an `unlock` that failed) exits after this long.
 const EMPTY_GRACE: Duration = Duration::from_secs(30);
+/// Mount retries (500 ms apart) for FSKit's asynchronous teardown of a previous volume.
+const MOUNT_RETRIES: u32 = 10;
 /// A profile still delivering after this long (hung) is dropped; leaves room for Touch ID prompts.
 const STAGING_LIMIT: Duration = Duration::from_secs(600);
 
@@ -48,12 +50,27 @@ pub fn serve() -> Result<()> {
 
     let mount = crate::paths::mount_point()?;
     crate::mountpoint::prepare(&mount)?;
-    let session = crate::fs::mount(shared.clone(), &mount, FUSE_OPTIONS).with_context(|| {
-        format!(
-            "mount {} (is macFUSE installed and its FSKit module enabled?)",
-            mount.display()
-        )
-    })?;
+    // FSKit tears a previous volume down asynchronously and has no "done" signal; a mount right
+    // after a vault exits can fail transiently (mount(8) returns 69). Retry briefly.
+    let mut attempt = 0;
+    let session = loop {
+        match crate::fs::mount(shared.clone(), &mount, FUSE_OPTIONS) {
+            Ok(s) => break s,
+            Err(e) if attempt < MOUNT_RETRIES => {
+                attempt += 1;
+                eprintln!("ramvault: mount attempt {attempt} failed ({e:#}), retrying");
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "mount {} (is macFUSE installed and its FSKit module enabled?)",
+                        mount.display()
+                    )
+                });
+            }
+        }
+    };
     // Anything failing from here on must not leave the volume mounted.
     let (socket, listener) = match finish_start(&mount) {
         Ok(x) => x,
@@ -102,9 +119,10 @@ pub fn serve() -> Result<()> {
 fn finish_start(mount: &std::path::Path) -> Result<(PathBuf, UnixListener)> {
     // FSKit attaches the volume asynchronously; answer `unlock` only once it is really there.
     wait_mounted(mount)?;
+    let source = crate::mountpoint::mounted_source(mount).context("mount vanished")?;
     std::fs::write(
         crate::paths::mount_record()?,
-        mount.as_os_str().as_encoded_bytes(),
+        crate::mountpoint::record_line(mount, &source),
     )?;
     let socket = crate::paths::socket()?;
     let _ = std::fs::remove_file(&socket);
@@ -149,8 +167,9 @@ fn block_signals() -> libc::sigset_t {
     }
 }
 
-/// macFUSE mount options: FSKit (user space, no kext), read-only, hidden from Finder.
-const FUSE_OPTIONS: &str = "backend=fskit,ro,noexec,nosuid,nodev,fsname=ramvault,volname=ramvault,nobrowse,noappledouble,noapplexattr";
+/// macFUSE mount options: FSKit (user space, no kext), read-only, hidden from Finder, and no
+/// macFUSE error dialogs (errors go to ramvault.err.log, which `unlock` shows).
+const FUSE_OPTIONS: &str = "backend=fskit,ro,noexec,nosuid,nodev,fsname=ramvault,volname=ramvault,nobrowse,noappledouble,noapplexattr,noalerts";
 
 impl Daemon {
     fn tick_loop(&self) {
@@ -248,16 +267,13 @@ impl Daemon {
                     let _ = std::fs::remove_file(r);
                 }
             }
-            if let Ok(p) = crate::paths::pid_file() {
-                let _ = std::fs::remove_file(p);
-            }
             self.shared.log.record("stop", json!({"reason": reason}));
             *done = true;
-            if crate::launchd::running_as_job() {
-                // Sends us SIGTERM; the signal thread lands back here and exits.
-                drop(done);
-                crate::launchd::stop();
-                std::process::exit(0);
+            // No self-bootout: a late `launchctl bootout` could hit the next vault, which a
+            // waiting `unlock` starts as soon as vault.pid is gone. The job stays loaded but not
+            // running (KeepAlive is off); the next `unlock` resets it.
+            if let Ok(p) = crate::paths::pid_file() {
+                let _ = std::fs::remove_file(p);
             }
         }
         std::process::exit(0);
@@ -400,7 +416,10 @@ impl Daemon {
                 })
             }
             Request::Lock { profiles } => {
-                let names: Vec<String> = if profiles.is_empty() {
+                // `lock` with no names stops everything, including unlocks in progress; naming
+                // profiles leaves another unlock that is still delivering alone.
+                let all = profiles.is_empty();
+                let names: Vec<String> = if all {
                     v.profiles.keys().cloned().collect()
                 } else {
                     profiles
@@ -413,7 +432,7 @@ impl Daemon {
                         unknown.push(n);
                     }
                 }
-                let empty = v.profiles.is_empty();
+                let empty = v.profiles.is_empty() && (all || v.staging.is_empty());
                 drop(v);
                 if empty {
                     self.close();

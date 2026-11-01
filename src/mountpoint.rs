@@ -20,11 +20,10 @@ pub enum State {
 /// directories owned by someone else, and other filesystems mounted there (including other
 /// macFUSE volumes: only a mount the vault recorded as its own counts as stale).
 pub fn check(p: &Path) -> Result<State> {
-    if is_mounted(p) {
-        let recorded = crate::paths::mount_record()
-            .ok()
-            .and_then(|r| std::fs::read_to_string(r).ok());
-        if recorded.as_deref() == Some(&*p.to_string_lossy()) {
+    if let Some(source) = mounted_source(p) {
+        // Ours only if the mount table shows the exact volume the vault recorded when it
+        // mounted (macfuse://<uuid>); never looks inside the volume (no privacy prompt).
+        if read_record().as_deref() == Some(&record_line(p, &source)) {
             return Ok(State::Stale);
         }
         bail!(
@@ -118,18 +117,33 @@ pub fn wait_gone(p: &Path, limit: Duration) -> bool {
     true
 }
 
-/// Is a macFUSE volume mounted exactly at `mount`?
-pub fn is_mounted(mount: &std::path::Path) -> bool {
-    let Ok(c) = std::ffi::CString::new(mount.as_os_str().as_encoded_bytes()) else {
-        return false;
-    };
+/// The record the vault writes after mounting: mount point and volume source, one line.
+pub fn record_line(p: &Path, source: &str) -> String {
+    format!("{}\t{source}", p.display())
+}
+
+fn read_record() -> Option<String> {
+    let r = crate::paths::mount_record().ok()?;
+    Some(std::fs::read_to_string(r).ok()?.trim_end().to_string())
+}
+
+/// The source (`macfuse://<uuid>`) of the macFUSE volume mounted exactly at `mount`, if any.
+pub fn mounted_source(mount: &Path) -> Option<String> {
+    let c = std::ffi::CString::new(mount.as_os_str().as_encoded_bytes()).ok()?;
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
-        return false;
+        return None;
     }
     let ty = unsafe { std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr()) };
     let on = unsafe { std::ffi::CStr::from_ptr(st.f_mntonname.as_ptr()) };
-    ty.to_bytes().starts_with(b"macfuse") && on.to_bytes() == c.as_bytes()
+    let from = unsafe { std::ffi::CStr::from_ptr(st.f_mntfromname.as_ptr()) };
+    (ty.to_bytes().starts_with(b"macfuse") && on.to_bytes() == c.as_bytes())
+        .then(|| from.to_string_lossy().into_owned())
+}
+
+/// Is a macFUSE volume mounted exactly at `mount`?
+pub fn is_mounted(mount: &Path) -> bool {
+    mounted_source(mount).is_some()
 }
 
 #[cfg(test)]

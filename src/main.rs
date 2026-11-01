@@ -161,18 +161,6 @@ fn resolve_profile(arg: &str) -> Result<(String, PathBuf)> {
 fn ensure_vault() -> Result<()> {
     // One start at a time: a second `unlock` racing this one waits here, then finds the vault.
     let _start = start_lock()?;
-    if let Ok(resp) = call(&Request::Status, None) {
-        // The mount point is fixed while the vault runs.
-        let wanted = settings::load()?.mount;
-        if let Some(m) = resp.mount.filter(|m| *m != wanted) {
-            eprintln!(
-                "ramvault: vault already mounted at {}; mount point {} applies after `ramvault lock`",
-                m.display(),
-                wanted.display()
-            );
-        }
-        return Ok(());
-    }
     let mount = settings::load()?.mount;
     // If a vault process is already alive (an earlier unlock was interrupted while it waited on
     // a prompt, or one is just exiting after `lock`), wait for it rather than restarting it; if
@@ -186,7 +174,15 @@ fn ensure_vault() -> Result<()> {
     let mut started = Instant::now();
     let mut told = false;
     loop {
-        if call(&Request::Status, None).is_ok() {
+        if let Ok(resp) = call(&Request::Status, None) {
+            // The mount point is fixed while the vault runs.
+            if let Some(m) = resp.mount.filter(|m| *m != mount) {
+                eprintln!(
+                    "ramvault: vault already mounted at {}; mount point {} applies after `ramvault lock`",
+                    m.display(),
+                    mount.display()
+                );
+            }
             return Ok(());
         }
         let alive = paths::vault_pid().is_some();

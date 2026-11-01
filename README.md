@@ -20,8 +20,8 @@ and least-privilege anyway (e.g. a 24 h `os:reader` talosconfig).
 
 | Piece | How |
 |---|---|
-| Process | `ramvault serve`, started on demand by `unlock` via `launchctl bootstrap gui/<uid>` of `~/Library/Application Support/ramvault/io.nhz.ramvault.plist`, deliberately **not** in `~/Library/LaunchAgents`, so it never starts at login. On exit it `bootout`s itself. |
-| Filesystem | macFUSE 5 with its **FSKit** backend (user space, no kernel extension), read-only, `nobrowse`, mounted at `~/.ramvault` (configurable). Tree: `/<profile>/<file>`, dirs 0500, files 0400, owner = you. |
+| Process | `ramvault serve`, started on demand by `unlock` via `launchctl bootstrap gui/<uid>` of `~/Library/Application Support/ramvault/io.nhz.ramvault.plist`, deliberately **not** in `~/Library/LaunchAgents`, so it never starts at login. On exit it simply exits: the job stays loaded but not running (`KeepAlive` off) until the next `unlock` resets it. |
+| Filesystem | macFUSE 5 with its **FSKit** backend (user space, no kernel extension), read-only, `nobrowse`, `noalerts` (no macFUSE error dialogs; errors go to `ramvault.err.log` and `unlock` shows them), mounted at `~/.ramvault` (configurable). A mount right after the previous vault exited is retried for up to 5 s (FSKit tears volumes down asynchronously). Tree: `/<profile>/<file>`, dirs 0500, files 0400, owner = you. |
 | FUSE glue | ~110 lines of C (`src/shim.c`) over macFUSE's libfuse3; every operation is answered in Rust (`src/fs.rs`). Not the `fuser` crate: it needs a `/dev/macfuse` file descriptor, which only the kext backend has. FSKit talks over its own channel that only libfuse drives. |
 | Delivery | `unlock` asks the vault for a one-time token and runs the profile with `RAMVAULT_TOKEN` etc. The profile calls `ramvault put <name>` (stdin → control socket → vault memory), `ramvault export KEY <name>`. Exit 0 commits atomically; anything else discards. Files are write-once. |
 | Who can read | Any process running as you; macFUSE refuses other users. There is no per-program check (see below). |
@@ -146,7 +146,8 @@ max = 86400             # seconds after unlock before a profile is dropped (at m
 | `max` | `RAMVAULT_MAX` | 86400 (also the cap) | `unlock` (per profile) |
 
 The mount point must be missing (created with mode 0700), an empty directory you own, or a dead
-ramvault mount (cleared; the vault records where it mounted, so another app's macFUSE volume is
+ramvault mount (cleared; the vault records the volume it mounted, `macfuse://<uuid>` from the
+mount table, so another app's macFUSE volume is
 never mistaken for one). Anything else is refused before the vault starts, with the reason: a
 file, a symlink, a non-empty directory (its files would be hidden), a directory owned by someone
 else, or another filesystem already mounted there.
