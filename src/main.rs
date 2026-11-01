@@ -229,7 +229,8 @@ fn ensure_vault() -> Result<()> {
             );
         }
         // Alive but its volume still not there: most likely waiting on a macOS prompt.
-        if !told && alive && elapsed > Duration::from_secs(5) && !mountpoint::is_mounted(&mount) {
+        // (Routine waits: leftover-mount cleanup plus mount retries stay well under 15 s.)
+        if !told && alive && elapsed > Duration::from_secs(15) && !mountpoint::is_mounted(&mount) {
             eprintln!("ramvault: still waiting for the vault to mount…{FSKIT_HINT}");
             told = true;
         }

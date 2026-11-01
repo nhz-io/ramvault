@@ -18,8 +18,10 @@ use std::time::{Duration, Instant};
 
 /// A vault with no profiles (e.g. an `unlock` that failed) exits after this long.
 const EMPTY_GRACE: Duration = Duration::from_secs(30);
-/// Mount retries (500 ms apart) for FSKit's asynchronous teardown of a previous volume.
-const MOUNT_RETRIES: u32 = 10;
+/// Mount retries (500 ms apart) for FSKit's asynchronous teardown of a previous volume: only
+/// failures faster than MOUNT_FAST_FAIL, within MOUNT_RETRY_WINDOW of the first attempt.
+const MOUNT_FAST_FAIL: Duration = Duration::from_secs(2);
+const MOUNT_RETRY_WINDOW: Duration = Duration::from_secs(5);
 /// A profile still delivering after this long (hung) is dropped; leaves room for Touch ID prompts.
 const STAGING_LIMIT: Duration = Duration::from_secs(600);
 
@@ -51,12 +53,16 @@ pub fn serve() -> Result<()> {
     let mount = crate::paths::mount_point()?;
     crate::mountpoint::prepare(&mount)?;
     // FSKit tears a previous volume down asynchronously and has no "done" signal; a mount right
-    // after a vault exits can fail transiently (mount(8) returns 69). Retry briefly.
+    // after a vault exits can fail transiently (mount(8) returns 69, within a second). Retry only
+    // such fast failures, briefly. A slow failure (e.g. macFUSE waited on the "enable file system
+    // extension" prompt) is reported at once instead of showing the prompt again.
+    let first = Instant::now();
     let mut attempt = 0;
     let session = loop {
+        let t = Instant::now();
         match crate::fs::mount(shared.clone(), &mount, FUSE_OPTIONS) {
             Ok(s) => break s,
-            Err(e) if attempt < MOUNT_RETRIES => {
+            Err(e) if t.elapsed() < MOUNT_FAST_FAIL && first.elapsed() < MOUNT_RETRY_WINDOW => {
                 attempt += 1;
                 eprintln!("ramvault: mount attempt {attempt} failed ({e:#}), retrying");
                 std::thread::sleep(Duration::from_millis(500));

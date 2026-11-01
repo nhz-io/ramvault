@@ -50,7 +50,7 @@ Notes:
   at most 10 minutes (a hung profile).
 - Several `unlock`s at once are fine: starting the vault is serialized by a lock file.
 - Starting the vault has no timeout: the first mount can wait on a macOS prompt (enable the
-  file system extension) for as long as you take; if the volume still hasn't appeared after 5 s,
+  file system extension) for as long as you take; if the volume still hasn't appeared after 15 s,
   `unlock` says what it's waiting for. If the vault exits instead, `unlock` shows its error
   (`~/Library/Logs/ramvault.err.log`, emptied before each start). Rerunning `unlock` after
   Ctrl-C waits for the vault that is already starting (`vault.pid` in the state directory)

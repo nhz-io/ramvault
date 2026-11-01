@@ -78,11 +78,23 @@ pub fn check(p: &Path) -> Result<State> {
 pub fn prepare(p: &Path) -> Result<()> {
     // A vault that just exited may still be detaching; give it a moment before forcing.
     if check(p)? == State::Stale && !wait_gone(p, Duration::from_secs(3)) {
-        let ok = std::process::Command::new("/sbin/umount")
-            .arg("-f")
-            .arg(p)
-            .status()
-            .is_ok_and(|s| s.success());
+        // `umount -f` fails with EINVAL while FSKit is still detaching; retry for a few seconds.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let ok = loop {
+            let done = std::process::Command::new("/sbin/umount")
+                .arg("-f")
+                .arg(p)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if done || !is_mounted(p) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
         if !ok {
             bail!(
                 "{} is still mounted from an earlier vault; run `umount -f {}`",
