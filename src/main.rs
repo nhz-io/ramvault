@@ -60,6 +60,8 @@ fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         // On failure the vault has already unmounted; the unlocking CLI sees it exit and
         // reports the error. (No self-bootout: launchd's SIGTERM is blocked here.)
+        // vault.pid stays behind (its process is gone, so it reads as not running): the CLI
+        // uses its presence to know this vault did run.
         Cmd::Serve => daemon::serve(),
         Cmd::Unlock { profiles } => unlock(&profiles),
         Cmd::Lock { profiles } => {
@@ -75,6 +77,10 @@ fn run(cli: Cli) -> Result<()> {
             let unlocked = call(&Request::Status, None)
                 .map(|r| r.profiles)
                 .unwrap_or_default();
+            // Never succeed with empty output: `eval` would leave tools on some other config.
+            if unlocked.is_empty() {
+                bail!("no profiles unlocked");
+            }
             // A silent empty output would let `eval` leave tools on some other config.
             let missing: Vec<&String> = profiles
                 .iter()
@@ -167,29 +173,54 @@ fn ensure_vault() -> Result<()> {
         }
         return Ok(());
     }
-    // Fail fast, with the reason, instead of a vault that never starts.
-    mountpoint::check(&settings::load()?.mount)?;
-    let env: Vec<(String, String)> = ["RAMVAULT_MOUNT"]
-        .iter()
-        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
-        .collect();
-    launchd::start(&env)?;
+    let mount = settings::load()?.mount;
+    // If a vault process is already alive (an earlier unlock was interrupted while it waited on
+    // a prompt, or one is just exiting after `lock`), wait for it rather than restarting it; if
+    // it goes away without answering, start a fresh one.
+    //
     // No deadline: the first mount can wait on a macOS prompt for as long as the user takes.
-    // Wait while the vault process lives; if it exits, show why. Ctrl-C stops waiting (a vault
-    // that mounts later exits by itself after 30 s with no profiles).
-    let started = Instant::now();
+    // Wait while the vault process lives; if the one we started exits, show why. Ctrl-C stops
+    // waiting (a vault that mounts later exits by itself after 30 s with no profiles).
+    let mut launched = false;
+    let mut seen = false;
+    let mut started = Instant::now();
     let mut told = false;
     loop {
         if call(&Request::Status, None).is_ok() {
             return Ok(());
         }
+        let alive = paths::vault_pid().is_some();
+        if !alive && !launched {
+            // Fail fast, with the reason, instead of a vault that never starts.
+            mountpoint::check(&mount)?;
+            let env: Vec<(String, String)> = ["RAMVAULT_MOUNT"]
+                .iter()
+                .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+                .collect();
+            let _ = std::fs::remove_file(paths::pid_file()?);
+            // Whatever the log holds after this is from this attempt.
+            let _ = std::fs::write(paths::stderr_log()?, b"");
+            launchd::start(&env)?;
+            launched = true;
+            started = Instant::now();
+            continue;
+        }
+        // The CLI removed vault.pid before launching: if it exists now, this vault ran.
+        seen |= launched && paths::pid_file()?.exists();
         let elapsed = started.elapsed();
-        if elapsed > Duration::from_secs(2) && !launchd::is_running() {
+        if launched && !alive && (seen || elapsed > Duration::from_secs(5)) {
             launchd::stop();
             let log = paths::stderr_log()?;
             let tail = std::fs::read_to_string(&log).unwrap_or_default();
             let tail: Vec<&str> = tail.lines().rev().take(5).collect();
             let why: String = tail.into_iter().rev().collect::<Vec<_>>().join("\n  ");
+            if !seen {
+                bail!(
+                    "launchd didn't start the vault ({}); check `launchctl print gui/$(id -u)/{}`",
+                    if why.is_empty() { "no output" } else { &why },
+                    launchd::LABEL
+                );
+            }
             bail!(
                 "the vault exited before it was ready:\n  {}\n(full log: {}){}",
                 if why.is_empty() { "(no output)" } else { &why },
@@ -201,8 +232,9 @@ fn ensure_vault() -> Result<()> {
                 }
             );
         }
-        if !told && elapsed > Duration::from_secs(3) {
-            eprintln!("ramvault: waiting for the vault to mount…{FSKIT_HINT}");
+        // Alive but its volume still not there: most likely waiting on a macOS prompt.
+        if !told && alive && elapsed > Duration::from_secs(5) && !mountpoint::is_mounted(&mount) {
+            eprintln!("ramvault: still waiting for the vault to mount…{FSKIT_HINT}");
             told = true;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -223,6 +255,11 @@ fn start_lock() -> Result<std::fs::File> {
         .write(true)
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        eprintln!("ramvault: waiting for another `ramvault unlock` that is starting the vault…");
+    } else {
+        return Ok(f);
+    }
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
         bail!(
             "lock {}: {}",

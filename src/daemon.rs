@@ -27,6 +27,8 @@ struct Daemon {
     socket: PathBuf,
     session: Mutex<Option<std::thread::JoinHandle<()>>>,
     shutdown: Mutex<bool>,
+    /// Set as soon as shutdown begins: no more requests are served.
+    closing: std::sync::atomic::AtomicBool,
 }
 
 static DAEMON: OnceLock<Daemon> = OnceLock::new();
@@ -34,12 +36,9 @@ static DAEMON: OnceLock<Daemon> = OnceLock::new();
 pub fn serve() -> Result<()> {
     harden();
     let signals = block_signals();
-    if crate::launchd::running_as_job() {
-        // launchd appends our stderr to ramvault.err.log; keep only this run's errors (the
-        // unlocking CLI shows them if we fail).
-        unsafe { libc::ftruncate(2, 0) };
-    }
     crate::paths::ensure_state_dir()?;
+    // First thing: lets `unlock` see this vault is alive (and wait) while it is still mounting.
+    std::fs::write(crate::paths::pid_file()?, std::process::id().to_string())?;
 
     let log = AuditLog::open(&crate::paths::audit_log()?)?;
     let shared = Arc::new(Shared {
@@ -61,7 +60,9 @@ pub fn serve() -> Result<()> {
         Err(e) => {
             crate::fs::stop();
             if crate::mountpoint::wait_gone(&mount, Duration::from_secs(5)) {
-                let _ = std::fs::remove_file(crate::paths::mount_record()?);
+                if let Ok(r) = crate::paths::mount_record() {
+                    let _ = std::fs::remove_file(r);
+                }
             }
             return Err(e);
         }
@@ -77,6 +78,7 @@ pub fn serve() -> Result<()> {
         socket,
         session: Mutex::new(Some(session)),
         shutdown: Mutex::new(false),
+        closing: std::sync::atomic::AtomicBool::new(false),
     });
     std::thread::spawn(move || {
         let mut sig: libc::c_int = 0;
@@ -204,7 +206,16 @@ impl Daemon {
     }
 
     /// Zeroize everything, unmount, remove the socket, leave launchd, exit. Runs once.
+    /// Stop taking requests: `unlock` must not hand profiles to a vault that is about to go.
+    fn close(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.closing.swap(true, Ordering::SeqCst) {
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+
     fn exit(&self, reason: &str) -> ! {
+        self.close();
         let mut done = self.shutdown.lock().unwrap();
         if !*done {
             {
@@ -237,6 +248,9 @@ impl Daemon {
                     let _ = std::fs::remove_file(r);
                 }
             }
+            if let Ok(p) = crate::paths::pid_file() {
+                let _ = std::fs::remove_file(p);
+            }
             self.shared.log.record("stop", json!({"reason": reason}));
             *done = true;
             if crate::launchd::running_as_job() {
@@ -251,6 +265,9 @@ impl Daemon {
 
     fn handle(&self, mut conn: UnixStream) -> Result<()> {
         peer_is_us(&conn)?;
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("vault is shutting down");
+        }
         // Unbuffered: a buffered reader would keep a stray, never-wiped copy of a `Put` payload.
         let line = read_header(&mut conn)?;
         let req: Request = serde_json::from_str(&line).context("bad request")?;
@@ -399,6 +416,7 @@ impl Daemon {
                 let empty = v.profiles.is_empty();
                 drop(v);
                 if empty {
+                    self.close();
                     // Reply first, then exit from another thread.
                     std::thread::spawn(|| {
                         std::thread::sleep(Duration::from_millis(100));

@@ -41,6 +41,31 @@ pub fn mount_record() -> Result<PathBuf> {
     Ok(state_dir()?.join("mounted"))
 }
 
+/// The vault's process ID, written first thing at start, removed on exit.
+pub fn pid_file() -> Result<PathBuf> {
+    Ok(state_dir()?.join("vault.pid"))
+}
+
+/// The running vault's PID, if `vault.pid` names a live `ramvault` process (not a reused PID).
+pub fn vault_pid() -> Option<i32> {
+    let pid: i32 = std::fs::read_to_string(pid_file().ok()?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    if pid <= 0 || unsafe { libc::kill(pid, 0) } != 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    let exe = PathBuf::from(String::from_utf8(buf).ok()?);
+    (exe.file_name()? == "ramvault").then_some(pid)
+}
+
 /// `~/.config/ramvault/config.toml`.
 pub fn config_file() -> Result<PathBuf> {
     Ok(home()?.join(".config/ramvault/config.toml"))

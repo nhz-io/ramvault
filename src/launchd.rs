@@ -87,16 +87,6 @@ pub fn start(env: &[(String, String)]) -> Result<()> {
     Ok(())
 }
 
-/// Is the vault job's process running right now?
-pub fn is_running() -> bool {
-    Command::new("launchctl")
-        .args(["print", &format!("{}/{LABEL}", domain())])
-        .output()
-        .is_ok_and(|o| {
-            o.status.success() && String::from_utf8_lossy(&o.stdout).contains("state = running")
-        })
-}
-
 pub fn stop() {
     let _ = Command::new("launchctl")
         .args(["bootout", &format!("{}/{LABEL}", domain())])
