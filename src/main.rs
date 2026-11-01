@@ -66,14 +66,15 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Unlock { profiles } => unlock(&profiles),
         Cmd::Lock { profiles } => {
             if call(&Request::Status, None).is_err() {
-                if paths::vault_pid().is_some() {
-                    // Alive but not answering: still mounting (or just exiting). It holds nothing.
-                    println!(
-                        "locked (a vault is starting or stopping with nothing unlocked; it exits by itself)"
+                if let Some(pid) = paths::vault_pid() {
+                    // Alive but not answering: normally starting or stopping (holding nothing),
+                    // but a wedged vault could still be serving files, so don't claim success.
+                    bail!(
+                        "the vault (pid {pid}) is not answering: it may be starting or stopping; \
+                         run `ramvault lock` again in a moment, or `kill {pid}` to stop it now"
                     );
-                } else {
-                    println!("locked (vault not running)");
                 }
+                println!("locked (vault not running)");
                 return Ok(());
             }
             call(&Request::Lock { profiles }, None)?;
