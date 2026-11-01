@@ -66,7 +66,14 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Unlock { profiles } => unlock(&profiles),
         Cmd::Lock { profiles } => {
             if call(&Request::Status, None).is_err() {
-                println!("locked (vault not running)");
+                if paths::vault_pid().is_some() {
+                    // Alive but not answering: still mounting (or just exiting). It holds nothing.
+                    println!(
+                        "locked (a vault is starting or stopping with nothing unlocked; it exits by itself)"
+                    );
+                } else {
+                    println!("locked (vault not running)");
+                }
                 return Ok(());
             }
             call(&Request::Lock { profiles }, None)?;
@@ -108,6 +115,9 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Put { name } => {
             let token = profile_token()?;
+            if unsafe { libc::isatty(0) } == 1 {
+                bail!("pipe the contents into `ramvault put {name}` (stdin is a terminal)");
+            }
             let data = secret::Secret::read_to_end(&mut std::io::stdin().lock())?;
             let len = data.len();
             call(&Request::Put { token, name, len }, Some(&data))?;
