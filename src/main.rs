@@ -5,6 +5,7 @@ mod launchd;
 mod paths;
 mod proto;
 mod secret;
+mod settings;
 mod vault;
 
 use anyhow::{Context, Result, bail};
@@ -13,9 +14,6 @@ use proto::{Request, call, call_keep, valid_name};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
-
-const DEFAULT_IDLE: u64 = 3600;
-const DEFAULT_MAX: u64 = 86400;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -27,7 +25,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run profiles and serve their files from ~/.ramvault (starts the vault if needed).
-    /// RAMVAULT_IDLE (default 3600 s) and RAMVAULT_MAX (default and cap 86400 s) set the timers.
+    /// Timers and mount point come from ~/.config/ramvault/config.toml or RAMVAULT_IDLE / RAMVAULT_MAX / RAMVAULT_MOUNT.
     Unlock {
         /// Name in ~/.config/ramvault/profiles/, or a path to an executable.
         #[arg(required = true)]
@@ -117,17 +115,6 @@ fn profile_token() -> Result<String> {
         .context("only works inside a profile run by `ramvault unlock` (RAMVAULT_TOKEN not set)")
 }
 
-fn secs_env(key: &str, default: u64) -> Result<u64> {
-    match std::env::var(key) {
-        Ok(v) => v
-            .parse::<u64>()
-            .ok()
-            .filter(|n| *n > 0)
-            .with_context(|| format!("{key}={v}: expected seconds > 0")),
-        Err(_) => Ok(default),
-    }
-}
-
 /// Profile name or path -> (name in the vault, executable).
 fn resolve_profile(arg: &str) -> Result<(String, PathBuf)> {
     let path = if arg.contains('/') {
@@ -154,10 +141,22 @@ fn resolve_profile(arg: &str) -> Result<(String, PathBuf)> {
 }
 
 fn ensure_vault() -> Result<()> {
-    if call(&Request::Status, None).is_ok() {
+    if let Ok(resp) = call(&Request::Status, None) {
+        // The mount point is fixed while the vault runs.
+        if std::env::var_os("RAMVAULT_MOUNT").is_some() {
+            let wanted = paths::mount_point()?;
+            if let Some(m) = resp.mount.filter(|m| *m != wanted) {
+                eprintln!(
+                    "ramvault: vault already mounted at {}; RAMVAULT_MOUNT={} applies after `ramvault lock`",
+                    m.display(),
+                    wanted.display()
+                );
+            }
+        }
         return Ok(());
     }
-    let env: Vec<(String, String)> = ["RAMVAULT_FUSE_OPTIONS"]
+    settings::load()?; // fail fast on a bad config instead of a vault that never starts
+    let env: Vec<(String, String)> = ["RAMVAULT_FUSE_OPTIONS", "RAMVAULT_MOUNT"]
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
         .collect();
@@ -177,14 +176,13 @@ fn ensure_vault() -> Result<()> {
 }
 
 fn unlock(args: &[String]) -> Result<()> {
-    let idle = secs_env("RAMVAULT_IDLE", DEFAULT_IDLE)?;
-    let max = secs_env("RAMVAULT_MAX", DEFAULT_MAX)?.min(DEFAULT_MAX);
+    // Validated here, before anything starts: config file plus RAMVAULT_* overrides.
+    let settings::Settings { idle, max, .. } = settings::load()?;
     let profiles = args
         .iter()
         .map(|a| resolve_profile(a))
         .collect::<Result<Vec<_>>>()?;
     ensure_vault()?;
-    let mount = paths::mount_point()?;
     let exe = std::env::current_exe()?;
     let mut failed = false;
     for (name, path) in profiles {
@@ -198,6 +196,9 @@ fn unlock(args: &[String]) -> Result<()> {
             None,
         )?;
         let token = begun.token.context("no token")?;
+        let mount = begun
+            .mount
+            .context("vault did not say where it is mounted")?;
         let st = Command::new(&path)
             .env("RAMVAULT_TOKEN", &token)
             .env("RAMVAULT_PROFILE", &name)
@@ -248,8 +249,11 @@ fn status() -> Result<()> {
         println!("locked (vault not running)");
         return Ok(());
     };
+    if let Some(m) = &resp.mount {
+        println!("vault mounted at {}", m.display());
+    }
     if resp.profiles.is_empty() {
-        println!("vault running, no profiles");
+        println!("no profiles");
     }
     for p in resp.profiles {
         println!(

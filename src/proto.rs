@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -48,6 +49,9 @@ pub struct Response {
     pub token: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<ProfileStatus>,
+    /// Where the vault is mounted (on `Begin` and `Status`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

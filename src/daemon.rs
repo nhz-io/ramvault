@@ -309,6 +309,7 @@ impl Daemon {
                 Ok(Response {
                     ok: true,
                     token: Some(token),
+                    mount: Some(self.mount.clone()),
                     ..Default::default()
                 })
             }
@@ -385,6 +386,7 @@ impl Daemon {
                 Ok(Response {
                     ok: true,
                     profiles: v.profiles.values().map(|p| p.status(now)).collect(),
+                    mount: Some(self.mount.clone()),
                     ..Default::default()
                 })
             }

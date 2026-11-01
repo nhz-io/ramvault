@@ -21,7 +21,7 @@ and least-privilege anyway (e.g. a 24 h `os:reader` talosconfig).
 | Piece | How |
 |---|---|
 | Process | `ramvault serve`, started on demand by `unlock` via `launchctl bootstrap gui/<uid>` of `~/Library/Application Support/ramvault/io.nhz.ramvault.plist`, deliberately **not** in `~/Library/LaunchAgents`, so it never starts at login. On exit it `bootout`s itself. |
-| Filesystem | macFUSE 5 with its **FSKit** backend (user space, no kernel extension), read-only, `nobrowse`, mounted at `~/.ramvault`. Tree: `/<profile>/<file>`, dirs 0500, files 0400, owner = you. |
+| Filesystem | macFUSE 5 with its **FSKit** backend (user space, no kernel extension), read-only, `nobrowse`, mounted at `~/.ramvault` (configurable). Tree: `/<profile>/<file>`, dirs 0500, files 0400, owner = you. |
 | FUSE glue | ~110 lines of C (`src/shim.c`) over macFUSE's libfuse3; every operation is answered in Rust (`src/fs.rs`). Not the `fuser` crate: it needs a `/dev/macfuse` file descriptor, which only the kext backend has. FSKit talks over its own channel that only libfuse drives. |
 | Delivery | `unlock` asks the vault for a one-time token and runs the profile with `RAMVAULT_TOKEN` etc. The profile calls `ramvault put <name>` (stdin → control socket → vault memory), `ramvault export KEY <name>`. Exit 0 commits atomically; anything else discards. Files are write-once. |
 | Who can read | Any process running as you; macFUSE refuses other users. There is no per-program check (see below). |
@@ -93,7 +93,7 @@ ramvault export TALOSCONFIG talosconfig
 ```bash
 ramvault unlock talos          # several profiles at once: ramvault unlock talos kube
 eval "$(ramvault env)"         # export TALOSCONFIG=~/.ramvault/talos/talosconfig ...
-ramvault status                # files, env, idle/max time left
+ramvault status                # mount point, files, env, idle/max time left
 ramvault lock                  # zeroize + unmount now (or: ramvault lock talos)
 ```
 
@@ -115,9 +115,23 @@ The second command prints the dummy line. After 10 s without an open, `ramvault 
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `RAMVAULT_IDLE` | 3600 | seconds without an open before a profile is dropped (read at `unlock`) |
-| `RAMVAULT_MAX` | 86400 | seconds after unlock before a profile is dropped; capped at 86400 |
-| `RAMVAULT_FUSE_OPTIONS` | | extra macFUSE mount options, comma-separated (read when the vault starts) |
+### Settings
+
+Optional `~/.config/ramvault/config.toml`; an environment variable overrides each key for one run
+(e.g. `RAMVAULT_IDLE=10 ramvault unlock demo`). Bad values are reported before anything starts.
+
+```toml
+mount = "~/.ramvault"   # where the vault appears; absolute or ~/…, its parent must exist
+idle = 3600             # seconds without an open before a profile is dropped
+max = 86400             # seconds after unlock before a profile is dropped (at most 86400)
+```
+
+| Key | Variable | Default | Read when |
+|---|---|---|---|
+| `mount` | `RAMVAULT_MOUNT` | `~/.ramvault` | the vault starts (fixed while it runs; `ramvault status` shows it) |
+| `idle` | `RAMVAULT_IDLE` | 3600 | `unlock` (per profile) |
+| `max` | `RAMVAULT_MAX` | 86400 (also the cap) | `unlock` (per profile) |
+| | `RAMVAULT_FUSE_OPTIONS` | | the vault starts: extra macFUSE mount options, comma-separated |
 
 ## Verified on panna (macOS 27.2, macFUSE 5.5.0)
 
