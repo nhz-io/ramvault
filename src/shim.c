@@ -31,9 +31,7 @@ static int op_getattr(const char *path, struct stat *st, struct fuse_file_info *
     st->st_uid = getuid();
     st->st_gid = getgid();
     st->st_blksize = 4096;
-    // Rust picks the mtime: "now" for files whose readers are checked (FSKit then drops its
-    // cache on open, so every open is followed by a read that reaches the check), the unlock
-    // time otherwise (FSKit may cache).
+    // The unlock time: changes on re-unlock, so FSKit drops cached contents of the old files.
     st->st_mtimespec = st->st_ctimespec = mtime;
     return 0;
 }
@@ -56,7 +54,7 @@ static int op_open(const char *path, struct fuse_file_info *fi) {
     struct fuse_context *ctx = fuse_get_context();
     int rc = rv_open(path, fi->flags, ctx->pid, ctx->uid);
     if (rc) return rc;
-    fi->direct_io = 1;   // ask for no page cache (FSKit caches anyway; opens always reach us)
+    fi->direct_io = 1;   // ask for no page cache (FSKit may cache anyway)
     fi->keep_cache = 0;
     return 0;
 }

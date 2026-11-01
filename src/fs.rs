@@ -1,20 +1,16 @@
 //! The FUSE side: a read-only tree `/<profile>/<file>` served from the vault's memory through
 //! macFUSE's libfuse3 (src/shim.c), so the FSKit backend works.
 //!
-//! FSKit reports no caller PID. Instead, each read is checked against the processes that hold the
-//! file open at that moment (src/holders.rs). A fresh mtime on every lookup (src/shim.c) makes
-//! FSKit drop its cache on open, so an open of a file nobody holds is followed by a read that
-//! reaches the check. While the file is held, FSKit neither forwards further opens nor reads:
-//! a concurrent opener shares the holder's cache unchecked (see README).
+//! Every open is logged and resets the profile's idle timer. FSKit may serve repeated reads from
+//! its own cache, so opens, not reads, are what counts as use.
 
 use crate::audit::AuditLog;
-use crate::caller::Identity;
 use crate::vault::{Node, Vault};
 use anyhow::{Result, bail};
 use serde_json::json;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, UNIX_EPOCH};
 
 pub struct Shared {
     pub vault: Mutex<Vault>,
@@ -87,81 +83,17 @@ fn with_node<T>(path: *const c_char, f: impl FnOnce(&Vault, Node) -> T) -> Resul
     Ok(f(&v, node))
 }
 
-/// Logs an open. Who opened is unknown here (FSKit reports no PID, and the opener holds no
-/// descriptor yet); the reader decision happens on read.
+/// Logs an open and refreshes its profile's last-use. The PID is 0 with FSKit (no caller identity).
 fn log_open(path: *const c_char, pid: i32, uid: u32) -> Result<(), c_int> {
     let sh = shared();
-    let (profile, file, any_reader) = with_node(path, |_, node| match node {
-        Node::File(p, name, _) => Ok((p.name.clone(), name.to_string(), p.any_reader)),
+    let (profile, file) = with_node(path, |_, node| match node {
+        Node::File(p, name, _) => Ok((p.name.clone(), name.to_string())),
         _ => Err(libc::EISDIR),
     })??;
     sh.log.record(
         "open",
         json!({"pid": pid, "uid": uid, "profile": profile, "file": file}),
     );
-    // Without the check FSKit may serve reads from cache, so opens are what we see of use.
-    if any_reader {
-        if let Some(p) = sh.vault.lock().unwrap().profiles.get_mut(&profile) {
-            p.last_use = Instant::now();
-        }
-    }
-    Ok(())
-}
-
-/// May this read be served? Every process holding the file open must be one of the profile's
-/// allowed programs, and there must be at least one. Logs the decision; refreshes last-use.
-fn check_read(path: *const c_char) -> Result<(), c_int> {
-    let sh = shared();
-    let (profile, file, allow, any_reader) = with_node(path, |_, node| match node {
-        Node::File(p, name, _) => Ok((
-            p.name.clone(),
-            name.to_string(),
-            p.allow.clone(),
-            p.any_reader,
-        )),
-        _ => Err(libc::EISDIR),
-    })??;
-    if any_reader {
-        // `ramvault allow --any`: any process of this user; no scan, no signature checks.
-        if let Some(p) = sh.vault.lock().unwrap().profiles.get_mut(&profile) {
-            p.last_use = Instant::now();
-        }
-        return Ok(());
-    }
-    let started = Instant::now();
-    let full = crate::paths::mount_point()
-        .map_err(|_| libc::EIO)?
-        .join(&profile)
-        .join(&file);
-    let readers: Vec<(i32, Option<Identity>, bool)> = crate::holders::holders(&full)
-        .into_iter()
-        .map(|pid| {
-            let id = Identity::of_pid(pid).ok();
-            let ok = id
-                .as_ref()
-                .is_some_and(|c| allow.iter().any(|a| a.admits(pid, c)));
-            (pid, id, ok)
-        })
-        .collect();
-    let allowed = !readers.is_empty() && readers.iter().all(|(_, _, ok)| *ok);
-    sh.log.record(
-        if allowed { "read" } else { "deny" },
-        json!({
-            "profile": profile,
-            "file": file,
-            "readers": readers.iter().map(|(pid, id, ok)| json!({
-                "pid": pid,
-                "path": id.as_ref().map(|c| &c.path),
-                "signing_id": id.as_ref().and_then(|c| c.signing_id.as_ref()),
-                "team_id": id.as_ref().and_then(|c| c.team_id.as_ref()),
-                "allowed": ok,
-            })).collect::<Vec<_>>(),
-            "check_ms": started.elapsed().as_millis() as u64,
-        }),
-    );
-    if !allowed {
-        return Err(libc::EACCES);
-    }
     if let Some(p) = sh.vault.lock().unwrap().profiles.get_mut(&profile) {
         p.last_use = Instant::now();
     }
@@ -177,15 +109,11 @@ extern "C" fn rv_getattr(
 ) -> c_int {
     let r = with_node(path, |_, node| match node {
         Node::Root | Node::Dir(_) => (libc::S_IFDIR as u32 | 0o500, 0, None),
-        Node::File(p, _, f) => {
-            // Checked files: a new mtime on every lookup defeats FSKit's cache (see module doc).
-            let t = if p.any_reader {
-                p.unlocked_wall
-            } else {
-                SystemTime::now()
-            };
-            (libc::S_IFREG as u32 | 0o400, f.data.len() as u64, Some(t))
-        }
+        Node::File(p, _, f) => (
+            libc::S_IFREG as u32 | 0o400,
+            f.data.len() as u64,
+            Some(p.unlocked_wall),
+        ),
     });
     match r {
         Ok((m, s, t)) => {
@@ -249,9 +177,6 @@ extern "C" fn rv_read(
     size: usize,
     off: i64,
 ) -> c_int {
-    if let Err(e) = check_read(path) {
-        return -e;
-    }
     let r = with_node(path, |_, node| {
         let Node::File(_, _, f) = node else {
             return -libc::EISDIR;

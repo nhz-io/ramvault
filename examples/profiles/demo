@@ -1,6 +1,5 @@
 #!/bin/sh
-# Demo profile: one dummy file plus an env var pointing at it, readable only by /sbin/md5
-# (a tool that reads the file but can only print a digest: never allow generic readers like cat).
+# Demo profile: one dummy file plus an env var pointing at it.
 # Install: cp examples/profiles/demo ~/.config/ramvault/profiles/  then  ramvault unlock demo
 set -eu
 rv=${RAMVAULT_BIN:-ramvault}
@@ -9,4 +8,3 @@ rv=${RAMVAULT_BIN:-ramvault}
 printf 'not-a-real-secret %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | "$rv" put demo.txt
 
 "$rv" export RAMVAULT_DEMO demo.txt
-"$rv" allow /sbin/md5

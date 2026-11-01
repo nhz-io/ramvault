@@ -2,7 +2,6 @@
 //! expires profiles, and on the last one gone zeroizes, unmounts and exits.
 
 use crate::audit::AuditLog;
-use crate::caller::Identity;
 use crate::fs::Shared;
 use crate::proto::{Request, Response, valid_env_key, valid_name};
 use crate::secret::{MAX_LEN, Secret};
@@ -300,8 +299,6 @@ impl Daemon {
                         name: profile,
                         files: BTreeMap::new(),
                         env: vec![],
-                        allow: vec![],
-                        any_reader: false,
                         unlocked: now,
                         unlocked_wall: std::time::SystemTime::now(),
                         last_use: now,
@@ -344,21 +341,6 @@ impl Daemon {
                 p.env.push((key, value));
                 Ok(Response::ok())
             }
-            Request::Allow { token, program } => {
-                // Verifying a signature hashes the whole binary: don't hold up reads meanwhile.
-                drop(v);
-                let id = Identity::of_program(&program)?;
-                let mut v = self.shared.vault.lock().unwrap();
-                let p = staged(&mut v, &token)?;
-                if !p.allow.contains(&id) {
-                    p.allow.push(id);
-                }
-                Ok(Response::ok())
-            }
-            Request::AllowAny { token } => {
-                staged(&mut v, &token)?.any_reader = true;
-                Ok(Response::ok())
-            }
             Request::Commit { token } => {
                 let p = v
                     .staging
@@ -377,17 +359,6 @@ impl Daemon {
                         p.name
                     );
                 }
-                match (p.any_reader, p.allow.is_empty()) {
-                    (false, true) => bail!(
-                        "profile {} declares no readers: `ramvault allow <program>…`, or `ramvault allow --any` for no check",
-                        p.name
-                    ),
-                    (true, false) => bail!(
-                        "profile {} uses both `allow --any` and `allow <program>`; pick one",
-                        p.name
-                    ),
-                    _ => {}
-                }
                 log.record(
                     "unlock",
                     json!({
@@ -395,8 +366,6 @@ impl Daemon {
                         "files": p.files.iter().map(|(n, f)| json!({"name": n, "size": f.data.len()})).collect::<Vec<_>>(),
                         "idle": p.idle.as_secs(),
                         "max": p.max.as_secs(),
-                        "allow": p.allow,
-                        "any_reader": p.any_reader,
                     }),
                 );
                 let status = p.status(Instant::now());

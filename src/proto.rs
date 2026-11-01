@@ -6,7 +6,6 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -26,14 +25,6 @@ pub enum Request {
         token: String,
         key: String,
         file: String,
-    },
-    Allow {
-        token: String,
-        program: PathBuf,
-    },
-    /// No reader check for this profile: any process of the user may read.
-    AllowAny {
-        token: String,
     },
     Commit {
         token: String,
@@ -64,8 +55,6 @@ pub struct ProfileStatus {
     pub name: String,
     pub files: Vec<(String, usize)>,
     pub env: Vec<(String, String)>,
-    pub allow: Vec<PathBuf>,
-    pub any_reader: bool,
     pub idle_left: u64,
     pub max_left: u64,
 }

@@ -1,8 +1,6 @@
 mod audit;
-mod caller;
 mod daemon;
 mod fs;
-mod holders;
 mod launchd;
 mod paths;
 mod proto;
@@ -37,7 +35,7 @@ enum Cmd {
     },
     /// Zeroize and remove profiles now (all of them, and stop the vault, when none are named).
     Lock { profiles: Vec<String> },
-    /// Unlocked profiles, their files, env, allowed programs and remaining time.
+    /// Unlocked profiles, their files, env and remaining time.
     Status,
     /// Print `export KEY=...` lines for unlocked profiles, for `eval "$(ramvault env)"`.
     Env { profiles: Vec<String> },
@@ -46,14 +44,6 @@ enum Cmd {
     Put { name: String },
     /// [inside a profile] Declare env KEY pointing at file NAME of this profile.
     Export { key: String, name: String },
-    /// [inside a profile] Allow PROGRAMs (name in PATH or path) to read this profile's files,
-    /// or `--any` to switch the reader check off for this profile (faster, any of your processes).
-    Allow {
-        #[arg(long, conflicts_with = "programs")]
-        any: bool,
-        #[arg(required_unless_present = "any")]
-        programs: Vec<String>,
-    },
 
     /// The vault process itself (started by launchd).
     #[command(hide = true)]
@@ -105,30 +95,6 @@ fn run(cli: Cli) -> Result<()> {
             let data = secret::Secret::read_to_end(&mut std::io::stdin().lock())?;
             let len = data.len();
             call(&Request::Put { token, name, len }, Some(&data))?;
-            Ok(())
-        }
-        Cmd::Allow { any: true, .. } => {
-            call(
-                &Request::AllowAny {
-                    token: profile_token()?,
-                },
-                None,
-            )?;
-            Ok(())
-        }
-        Cmd::Allow { programs, .. } => {
-            let token = profile_token()?;
-            for p in programs {
-                // Resolved here, with the profile's PATH; the vault reads the signature.
-                let program = caller::resolve_program(&p)?;
-                call(
-                    &Request::Allow {
-                        token: token.clone(),
-                        program,
-                    },
-                    None,
-                )?;
-            }
             Ok(())
         }
         Cmd::Export { key, name } => {
@@ -297,12 +263,6 @@ fn status() -> Result<()> {
         }
         for (k, v) in &p.env {
             println!("  env    {k}={v}");
-        }
-        if p.any_reader {
-            println!("  allow  any process of this user (no reader check)");
-        }
-        for a in &p.allow {
-            println!("  allow  {}", a.display());
         }
     }
     Ok(())
