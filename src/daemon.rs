@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 
 /// A vault with no profiles (e.g. an `unlock` that failed) exits after this long.
 const EMPTY_GRACE: Duration = Duration::from_secs(30);
+/// A profile still delivering after this long (hung) is dropped; leaves room for Touch ID prompts.
+const STAGING_LIMIT: Duration = Duration::from_secs(600);
 
 struct Daemon {
     shared: Arc<Shared>,
@@ -41,14 +43,18 @@ pub fn serve() -> Result<()> {
 
     let mount = crate::paths::mount_point()?;
     crate::mountpoint::prepare(&mount)?;
-    let session = crate::fs::mount(shared.clone(), &mount, &fuse_options()).with_context(|| {
+    let session = crate::fs::mount(shared.clone(), &mount, FUSE_OPTIONS).with_context(|| {
         format!(
             "mount {} (is macFUSE installed and its FSKit module enabled?)",
             mount.display()
         )
     })?;
     // FSKit attaches the volume asynchronously; answer `unlock` only once it is really there.
-    wait_mounted(&mount).inspect_err(|_| crate::fs::unmount())?;
+    wait_mounted(&mount).inspect_err(|_| crate::fs::stop())?;
+    std::fs::write(
+        crate::paths::mount_record()?,
+        mount.as_os_str().as_encoded_bytes(),
+    )?;
 
     let socket = crate::paths::socket()?;
     let dir = socket.parent().unwrap();
@@ -91,25 +97,12 @@ pub fn serve() -> Result<()> {
 fn wait_mounted(mount: &std::path::Path) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if is_mounted(mount) {
+        if crate::mountpoint::is_mounted(mount) {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     bail!("{} did not appear as a macFUSE volume", mount.display())
-}
-
-pub fn is_mounted(mount: &std::path::Path) -> bool {
-    let Ok(c) = std::ffi::CString::new(mount.as_os_str().as_encoded_bytes()) else {
-        return false;
-    };
-    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
-        return false;
-    }
-    let ty = unsafe { std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr()) };
-    let on = unsafe { std::ffi::CStr::from_ptr(st.f_mntonname.as_ptr()) };
-    ty.to_bytes().starts_with(b"macfuse") && on.to_bytes() == c.as_bytes()
 }
 
 /// No core dumps (they would write vault memory to disk) and no debugger attach.
@@ -137,29 +130,7 @@ fn block_signals() -> libc::sigset_t {
 }
 
 /// macFUSE mount options: FSKit (user space, no kext), read-only, hidden from Finder.
-/// RAMVAULT_FUSE_OPTIONS appends more.
-fn fuse_options() -> String {
-    let mut opts = vec![
-        "backend=fskit",
-        "ro",
-        "noexec",
-        "nosuid",
-        "nodev",
-        "fsname=ramvault",
-        "volname=ramvault",
-        "nobrowse",
-        "noappledouble",
-        "noapplexattr",
-    ]
-    .join(",");
-    if let Ok(extra) = std::env::var("RAMVAULT_FUSE_OPTIONS") {
-        if !extra.is_empty() {
-            opts.push(',');
-            opts.push_str(&extra);
-        }
-    }
-    opts
-}
+const FUSE_OPTIONS: &str = "backend=fskit,ro,noexec,nosuid,nodev,fsname=ramvault,volname=ramvault,nobrowse,noappledouble,noapplexattr";
 
 impl Daemon {
     fn tick_loop(&self) {
@@ -180,6 +151,20 @@ impl Daemon {
                     self.shared
                         .log
                         .record("expire", json!({"profile": name, "reason": reason}));
+                }
+                let hung: Vec<String> = v
+                    .staging
+                    .iter()
+                    .filter(|(_, p)| now.duration_since(p.unlocked) >= STAGING_LIMIT)
+                    .map(|(t, _)| t.clone())
+                    .collect();
+                for t in hung {
+                    if let Some(p) = v.staging.remove(&t) {
+                        self.shared.log.record(
+                            "abandon",
+                            json!({"profile": p.name, "reason": "still delivering after 10 min"}),
+                        );
+                    }
                 }
                 had_profiles |= !v.profiles.is_empty();
                 let empty = v.profiles.is_empty() && v.staging.is_empty();
@@ -210,7 +195,7 @@ impl Daemon {
                 v.staging.clear();
             }
             if let Some(serving) = self.session.lock().unwrap().take() {
-                crate::fs::unmount();
+                crate::fs::stop();
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while !serving.is_finished() && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(50));
@@ -227,6 +212,13 @@ impl Daemon {
                 }
             }
             let _ = std::fs::remove_file(&self.socket);
+            // FSKit detaches the volume asynchronously; leave only once it is gone, so the
+            // next vault doesn't find it half-detached.
+            if crate::mountpoint::wait_gone(&self.mount, Duration::from_secs(5)) {
+                if let Ok(r) = crate::paths::mount_record() {
+                    let _ = std::fs::remove_file(r);
+                }
+            }
             self.shared.log.record("stop", json!({"reason": reason}));
             *done = true;
             if crate::launchd::running_as_job() {
@@ -378,9 +370,12 @@ impl Daemon {
                 } else {
                     profiles
                 };
-                for n in &names {
-                    if v.profiles.remove(n).is_some() {
+                let mut unknown = vec![];
+                for n in names {
+                    if v.profiles.remove(&n).is_some() {
                         log.record("lock", json!({"profile": n}));
+                    } else {
+                        unknown.push(n);
                     }
                 }
                 let empty = v.profiles.is_empty();
@@ -391,6 +386,9 @@ impl Daemon {
                         std::thread::sleep(Duration::from_millis(100));
                         DAEMON.get().unwrap().exit("locked");
                     });
+                }
+                if !unknown.is_empty() {
+                    bail!("not unlocked: {}", unknown.join(", "));
                 }
                 Ok(Response::ok())
             }

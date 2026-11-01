@@ -22,6 +22,7 @@ static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 unsafe extern "C" {
     fn rv_fuse_mount(mountpoint: *const c_char, opts: *const c_char) -> c_int;
     fn rv_fuse_loop() -> c_int;
+    fn rv_fuse_exit();
     fn rv_fuse_unmount();
 }
 
@@ -45,10 +46,14 @@ pub fn mount(
     }))
 }
 
-/// Unmounts; the serving thread then returns.
-pub fn unmount() {
+/// Ends the serving loop, then unmounts (which wakes the loop so it sees the exit); the serving
+/// thread then returns.
+pub fn stop() {
     if SHARED.get().is_some() {
-        unsafe { rv_fuse_unmount() };
+        unsafe {
+            rv_fuse_exit();
+            rv_fuse_unmount();
+        }
     }
 }
 

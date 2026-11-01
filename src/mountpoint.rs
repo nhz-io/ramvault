@@ -4,6 +4,7 @@
 use anyhow::{Context, Result, bail};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, PartialEq)]
 pub enum State {
@@ -11,15 +12,25 @@ pub enum State {
     Missing,
     /// An empty directory owned by the user.
     EmptyDir,
-    /// A macFUSE mount left by a vault that died without unmounting; the vault clears it.
+    /// A ramvault mount left by a vault that died without unmounting; the vault clears it.
     Stale,
 }
 
 /// Refuses anything ramvault could damage or hide: files, symlinks, non-empty directories,
-/// directories owned by someone else, and other filesystems mounted there.
+/// directories owned by someone else, and other filesystems mounted there (including other
+/// macFUSE volumes: only a mount the vault recorded as its own counts as stale).
 pub fn check(p: &Path) -> Result<State> {
-    if crate::daemon::is_mounted(p) {
-        return Ok(State::Stale);
+    if is_mounted(p) {
+        let recorded = crate::paths::mount_record()
+            .ok()
+            .and_then(|r| std::fs::read_to_string(r).ok());
+        if recorded.as_deref() == Some(&*p.to_string_lossy()) {
+            return Ok(State::Stale);
+        }
+        bail!(
+            "another macFUSE volume is mounted at {}; unmount it or choose another mount point",
+            p.display()
+        );
     }
     let meta = match std::fs::symlink_metadata(p) {
         Ok(m) => m,
@@ -66,7 +77,8 @@ pub fn check(p: &Path) -> Result<State> {
 
 /// Vault side: make the mount point ready (clear a stale mount, create, 0700).
 pub fn prepare(p: &Path) -> Result<()> {
-    if check(p)? == State::Stale {
+    // A vault that just exited may still be detaching; give it a moment before forcing.
+    if check(p)? == State::Stale && !wait_gone(p, Duration::from_secs(3)) {
         let ok = std::process::Command::new("/sbin/umount")
             .arg("-f")
             .arg(p)
@@ -92,6 +104,32 @@ pub fn prepare(p: &Path) -> Result<()> {
             std::fs::Permissions::from_mode(0o700),
         )?),
     }
+}
+
+/// Waits up to `limit` for the macFUSE volume at `p` to go away; true if it did.
+pub fn wait_gone(p: &Path, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    while is_mounted(p) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
+}
+
+/// Is a macFUSE volume mounted exactly at `mount`?
+pub fn is_mounted(mount: &std::path::Path) -> bool {
+    let Ok(c) = std::ffi::CString::new(mount.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return false;
+    }
+    let ty = unsafe { std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr()) };
+    let on = unsafe { std::ffi::CStr::from_ptr(st.f_mntonname.as_ptr()) };
+    ty.to_bytes().starts_with(b"macfuse") && on.to_bytes() == c.as_bytes()
 }
 
 #[cfg(test)]

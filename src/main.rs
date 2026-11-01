@@ -142,6 +142,8 @@ fn resolve_profile(arg: &str) -> Result<(String, PathBuf)> {
 }
 
 fn ensure_vault() -> Result<()> {
+    // One start at a time: a second `unlock` racing this one waits here, then finds the vault.
+    let _start = start_lock()?;
     if let Ok(resp) = call(&Request::Status, None) {
         // The mount point is fixed while the vault runs.
         let wanted = settings::load()?.mount;
@@ -156,7 +158,7 @@ fn ensure_vault() -> Result<()> {
     }
     // Fail fast, with the reason, instead of a vault that never starts.
     mountpoint::check(&settings::load()?.mount)?;
-    let env: Vec<(String, String)> = ["RAMVAULT_FUSE_OPTIONS", "RAMVAULT_MOUNT"]
+    let env: Vec<(String, String)> = ["RAMVAULT_MOUNT"]
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
         .collect();
@@ -173,6 +175,27 @@ fn ensure_vault() -> Result<()> {
         "vault did not start; see {}",
         paths::stderr_log()?.display()
     )
+}
+
+/// Exclusive lock on `start.lock`, released when the returned file is dropped.
+fn start_lock() -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let path = paths::start_lock()?;
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        bail!(
+            "lock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(f)
 }
 
 fn unlock(args: &[String]) -> Result<()> {

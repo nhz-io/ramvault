@@ -15,6 +15,17 @@ pub fn mount_point() -> Result<PathBuf> {
     Ok(crate::settings::load()?.mount)
 }
 
+/// Serializes vault starts between concurrent `unlock`s.
+pub fn start_lock() -> Result<PathBuf> {
+    Ok(home()?.join("Library/Caches/ramvault/start.lock"))
+}
+
+/// Where the running (or crashed) vault mounted; removed on a clean exit. Lets the next start
+/// tell a dead ramvault mount from someone else's macFUSE volume.
+pub fn mount_record() -> Result<PathBuf> {
+    Ok(home()?.join("Library/Caches/ramvault/mounted"))
+}
+
 /// `~/.config/ramvault/config.toml`.
 pub fn config_file() -> Result<PathBuf> {
     Ok(home()?.join(".config/ramvault/config.toml"))

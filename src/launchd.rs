@@ -102,7 +102,7 @@ mod tests {
         let p = super::plist(
             "/Users/a b/.local/bin/ramvault".as_ref(),
             "/tmp/x&y.log".as_ref(),
-            &[("RAMVAULT_FUSE_OPTIONS".into(), "backend=fskit".into())],
+            &[("RAMVAULT_MOUNT".into(), "~/a&b".into())],
         );
         assert!(p.contains("x&amp;y"));
         let f = std::env::temp_dir().join(format!("ramvault-plist-{}", std::process::id()));

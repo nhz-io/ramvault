@@ -6,7 +6,7 @@ memory and ejects itself when you stop using it.
 `ramvault unlock talos` runs a *profile* (your script) that mints or decrypts credentials and pipes
 them into the vault. Tools then read plain files such as `~/.ramvault/talos/talosconfig`, with no
 Touch ID prompt per read. After `RAMVAULT_IDLE` seconds without use (default 1 h), or
-`RAMVAULT_MAX` seconds after unlock (default and hard cap 24 h), the vault zeroizes its memory,
+`RAMVAULT_MAX` seconds after unlock (default and hard cap 24 h), the vault wipes its copies,
 unmounts and exits. Nothing runs while it's locked.
 
 ## Why
@@ -25,10 +25,10 @@ and least-privilege anyway (e.g. a 24 h `os:reader` talosconfig).
 | FUSE glue | ~110 lines of C (`src/shim.c`) over macFUSE's libfuse3; every operation is answered in Rust (`src/fs.rs`). Not the `fuser` crate: it needs a `/dev/macfuse` file descriptor, which only the kext backend has. FSKit talks over its own channel that only libfuse drives. |
 | Delivery | `unlock` asks the vault for a one-time token and runs the profile with `RAMVAULT_TOKEN` etc. The profile calls `ramvault put <name>` (stdin → control socket → vault memory), `ramvault export KEY <name>`. Exit 0 commits atomically; anything else discards. Files are write-once. |
 | Who can read | Any process running as you; macFUSE refuses other users. There is no per-program check (see below). |
-| Memory | Each file is one exact-size buffer, `mlock`ed (no swap), zeroized (`zeroize`) on expiry, lock, re-unlock and exit. Core dumps off (`RLIMIT_CORE=0`), `PT_DENY_ATTACH`. |
+| Memory | ramvault keeps each file in one exact-size buffer, `mlock`ed (no swap) and zeroized (`zeroize`) on expiry, lock, re-unlock and exit; delivery doesn't copy it anywhere else in ramvault. Core dumps off (`RLIMIT_CORE=0`), `PT_DENY_ATTACH`. **Not wiped by ramvault:** copies made by libfuse while answering a read (its reply buffers, freed without wiping, gone when the vault exits), by FSKit/macFUSE in their own processes (their cache, dropped on unmount), and by every program that reads the file. |
 | Timers | Per profile: idle since the last open of one of its files, max since unlock. The vault exits when the last profile is gone (or 30 s after start with none). |
 | Control | `~/Library/Caches/ramvault/ctl.sock` (0600, dir 0700, peer uid checked). JSON lines. |
-| Audit log | `~/Library/Logs/ramvault.log` (0600), JSON lines: start, unlock (file names and sizes), every open, expire, lock, abandon (interrupted unlock), stop. Never contents. |
+| Audit log | `~/Library/Logs/ramvault.log` (0600), JSON lines: start, unlock (file names and sizes), every open, expire, lock, abandon (interrupted or hung unlock), stop. Never contents. Rotated to `ramvault.log.1` at 1 MiB, so at most about 2 MiB on disk. |
 
 ### What it protects against, and what not
 
@@ -46,7 +46,10 @@ Notes:
 - FSKit may serve repeated reads from its own cache, but every open reaches ramvault, so idle
   time counts from the last open.
 - An interrupted `unlock` (Ctrl-C, closed terminal) drops the half-delivered profile at once:
-  the vault keeps a staged profile only while the unlocking command's connection is open.
+  the vault keeps a staged profile only while the unlocking command's connection is open, and
+  at most 10 minutes (a hung profile).
+- Several `unlock`s at once are fine: starting the vault is serialized by a lock file.
+- `ramvault lock <name>` fails, naming it, if that profile isn't unlocked.
 - A vault that died without unmounting (killed, crashed) leaves a dead mount; the next start
   force-unmounts it.
 - The volume has no disk device behind it: no disk image, no network, only memory and local system
@@ -131,10 +134,10 @@ max = 86400             # seconds after unlock before a profile is dropped (at m
 | `mount` | `RAMVAULT_MOUNT` | `~/.ramvault` | the vault starts (fixed while it runs; `ramvault status` shows it) |
 | `idle` | `RAMVAULT_IDLE` | 3600 | `unlock` (per profile) |
 | `max` | `RAMVAULT_MAX` | 86400 (also the cap) | `unlock` (per profile) |
-| | `RAMVAULT_FUSE_OPTIONS` | | the vault starts: extra macFUSE mount options, comma-separated |
 
 The mount point must be missing (created with mode 0700), an empty directory you own, or a dead
-ramvault mount (cleared). Anything else is refused before the vault starts, with the reason: a
+ramvault mount (cleared; the vault records where it mounted, so another app's macFUSE volume is
+never mistaken for one). Anything else is refused before the vault starts, with the reason: a
 file, a symlink, a non-empty directory (its files would be hidden), a directory owned by someone
 else, or another filesystem already mounted there.
 
