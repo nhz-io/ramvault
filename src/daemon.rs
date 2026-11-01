@@ -10,7 +10,7 @@ use crate::vault::{Profile, Vault};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -41,8 +41,25 @@ pub fn serve() -> Result<()> {
     });
 
     let mount = crate::paths::mount_point()?;
-    std::fs::create_dir_all(&mount)?;
-    std::fs::set_permissions(&mount, std::fs::Permissions::from_mode(0o700))?;
+    if is_mounted(&mount) {
+        // Left behind by a vault that died without unmounting (killed, crashed).
+        let ok = std::process::Command::new("/sbin/umount")
+            .arg("-f")
+            .arg(&mount)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            bail!(
+                "{} is still mounted from an earlier vault; run `umount -f {}`",
+                mount.display(),
+                mount.display()
+            );
+        }
+    }
+    match std::fs::create_dir(&mount) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e)?,
+        _ => std::fs::set_permissions(&mount, std::fs::Permissions::from_mode(0o700))?,
+    }
     let session = crate::fs::mount(shared.clone(), &mount, &fuse_options()).with_context(|| {
         format!(
             "mount {} (is macFUSE installed and its FSKit module enabled?)",
@@ -101,7 +118,7 @@ fn wait_mounted(mount: &std::path::Path) -> Result<()> {
     bail!("{} did not appear as a macFUSE volume", mount.display())
 }
 
-fn is_mounted(mount: &std::path::Path) -> bool {
+pub fn is_mounted(mount: &std::path::Path) -> bool {
     let Ok(c) = std::ffi::CString::new(mount.as_os_str().as_encoded_bytes()) else {
         return false;
     };
@@ -243,17 +260,27 @@ impl Daemon {
 
     fn handle(&self, mut conn: UnixStream) -> Result<()> {
         peer_is_us(&conn)?;
-        let mut reader = BufReader::new(conn.try_clone()?);
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
+        // Unbuffered: a buffered reader would keep a stray, never-wiped copy of a `Put` payload.
+        let line = read_header(&mut conn)?;
         let req: Request = serde_json::from_str(&line).context("bad request")?;
-        let resp = match self.dispatch(req, &mut reader) {
+        let resp = match self.dispatch(req, &mut conn) {
             Ok(r) => r,
             Err(e) => Response::err(format!("{e:#}")),
         };
         let mut out = serde_json::to_vec(&resp)?;
         out.push(b'\n');
         conn.write_all(&out)?;
+        if let Some(token) = resp.token {
+            // `Begin`: the unlocking CLI holds this connection until it commits or aborts.
+            // EOF (done, Ctrl-C, killed) drops whatever is still staged under the token.
+            let mut b = [0u8; 64];
+            while matches!(conn.read(&mut b), Ok(n) if n > 0) {}
+            if let Some(p) = self.shared.vault.lock().unwrap().staging.remove(&token) {
+                self.shared
+                    .log
+                    .record("abandon", json!({"profile": p.name}));
+            }
+        }
         Ok(())
     }
 
@@ -318,8 +345,11 @@ impl Daemon {
                 Ok(Response::ok())
             }
             Request::Allow { token, program } => {
-                let p = staged(&mut v, &token)?;
+                // Verifying a signature hashes the whole binary: don't hold up reads meanwhile.
+                drop(v);
                 let id = Identity::of_program(&program)?;
+                let mut v = self.shared.vault.lock().unwrap();
+                let p = staged(&mut v, &token)?;
                 if !p.allow.contains(&id) {
                     p.allow.push(id);
                 }
@@ -413,6 +443,25 @@ impl Daemon {
             }
         }
     }
+}
+
+/// One request line, read byte by byte (requests are small JSON headers).
+fn read_header(conn: &mut UnixStream) -> Result<String> {
+    let mut line = Vec::with_capacity(256);
+    let mut b = [0u8; 1];
+    loop {
+        if conn.read(&mut b)? == 0 {
+            bail!("connection closed before a request");
+        }
+        if b[0] == b'\n' {
+            break;
+        }
+        line.push(b[0]);
+        if line.len() > 64 * 1024 {
+            bail!("request line too long");
+        }
+    }
+    Ok(String::from_utf8(line)?)
 }
 
 fn staged<'a>(v: &'a mut Vault, token: &str) -> Result<&'a mut Profile> {

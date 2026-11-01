@@ -9,9 +9,14 @@ pub fn home() -> Result<PathBuf> {
         .context("HOME is not set")
 }
 
-/// Mount point; profiles appear as `~/.ramvault/<profile>/<file>`.
+/// Mount point; profiles appear as `~/.ramvault/<profile>/<file>`. HOME is resolved to its real
+/// path because the kernel reports mounts and open files by that path. The mount point itself is
+/// not touched here (this runs inside FUSE callbacks, and it may be a dead mount).
 pub fn mount_point() -> Result<PathBuf> {
-    Ok(home()?.join(".ramvault"))
+    let home = home()?;
+    let home =
+        std::fs::canonicalize(&home).with_context(|| format!("resolve {}", home.display()))?;
+    Ok(home.join(".ramvault"))
 }
 
 /// Control socket between the CLI and the vault process.

@@ -93,6 +93,12 @@ pub fn connect() -> Result<UnixStream> {
 
 /// Sends one request (plus optional payload) and reads the response.
 pub fn call(req: &Request, payload: Option<&Secret>) -> Result<Response> {
+    call_keep(req, payload).map(|(resp, _)| resp)
+}
+
+/// Like `call`, but hands back the connection. For `Begin` the vault keeps the staged profile
+/// only while this connection is open, so an interrupted `unlock` cleans up by itself.
+pub fn call_keep(req: &Request, payload: Option<&Secret>) -> Result<(Response, UnixStream)> {
     let mut s = connect()?;
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
@@ -109,7 +115,7 @@ pub fn call(req: &Request, payload: Option<&Secret>) -> Result<Response> {
     if !resp.ok {
         bail!("{}", resp.error.unwrap_or_else(|| "request failed".into()));
     }
-    Ok(resp)
+    Ok((resp, s))
 }
 
 /// Profile and file names: one path component, no surprises.

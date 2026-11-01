@@ -2,8 +2,10 @@
 //! macFUSE's libfuse3 (src/shim.c), so the FSKit backend works.
 //!
 //! FSKit reports no caller PID. Instead, each read is checked against the processes that hold the
-//! file open at that moment (src/holders.rs); a fresh mtime on every lookup (src/shim.c) makes
-//! FSKit drop its cache on open, so every open is followed by a read that reaches this check.
+//! file open at that moment (src/holders.rs). A fresh mtime on every lookup (src/shim.c) makes
+//! FSKit drop its cache on open, so an open of a file nobody holds is followed by a read that
+//! reaches the check. While the file is held, FSKit neither forwards further opens nor reads:
+//! a concurrent opener shares the holder's cache unchecked (see README).
 
 use crate::audit::AuditLog;
 use crate::caller::Identity;
@@ -86,7 +88,7 @@ fn with_node<T>(path: *const c_char, f: impl FnOnce(&Vault, Node) -> T) -> Resul
 }
 
 /// Logs an open. Who opened is unknown here (FSKit reports no PID, and the opener holds no
-/// descriptor yet); the decision happens on read.
+/// descriptor yet); the reader decision happens on read.
 fn log_open(path: *const c_char, pid: i32, uid: u32) -> Result<(), c_int> {
     let sh = shared();
     let (profile, file, any_reader) = with_node(path, |_, node| match node {

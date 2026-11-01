@@ -31,6 +31,23 @@ and least-privilege anyway (e.g. a 24 h `os:reader` talosconfig).
 | Control | `~/Library/Caches/ramvault/ctl.sock` (0600, dir 0700, peer uid checked). JSON lines. |
 | Audit log | `~/Library/Logs/ramvault.log` (0600), JSON lines: start, unlock (file names, sizes, allowed programs), every open, every read / deny with the reading processes (pid, path, signing id, verdict), expire, lock, stop. Never contents. |
 
+### What it protects against, and what not
+
+It protects the credential **file**: it lives only in memory, only for a bounded time, and with
+`allow <program>…` only the named programs can read its contents, so other programs (a stray
+script, a compromised editor plugin, an `npm install` hook) can't copy it to use elsewhere.
+
+It does **not** stop malware running as you from **using** the credential through an allowed
+program: anything that can run `kubectl` can do `kubectl get secrets`, or simply
+`kubectl config view --raw` to print the whole file. Ad-hoc signed tools (most Homebrew bottles)
+also accept injected libraries (`DYLD_INSERT_LIBRARIES`) without failing the signature check. What
+bounds that damage is the credential itself: least privilege (`view`, `os:reader`), a short
+lifetime (24 h), and idle eject. So:
+
+- allow only the programs that consume the credential (`talosctl`, `kubectl`), never generic
+  readers (`cat`, `less`, `python3`, shells): `cat file | anything` would pass the check;
+- mint credentials with the least privilege and shortest lifetime that work.
+
 ### Who can read
 
 Each profile declares its readers, one of:
@@ -74,7 +91,18 @@ and that needs Reduced Security on Apple Silicon. ramvault identifies readers an
 
 Limits, by design or by FSKit:
 
+- **Concurrent readers aren't checked.** While a process holds the file open, FSKit forwards
+  neither further opens nor reads: a second process that opens it meanwhile is served from
+  FSKit's cache, unchecked (verified: `head` read the file while an allowed `tail -f` held it).
+  Readers like `kubectl` and `talosctl` hold the file for milliseconds, but a same-user attacker
+  can time it. This is the same class of attacker the section above can't stop, and only the
+  kext backend (per-operation PIDs) would close it.
+
 - Opening and `stat` work for any of your processes; only contents are protected.
+- An interrupted `unlock` (Ctrl-C, closed terminal) drops the half-delivered profile at once:
+  the vault keeps a staged profile only while the unlocking command's connection is open.
+- A vault that died without unmounting (killed, crashed) leaves a dead mount; the next start
+  force-unmounts it.
 - Upgrading an allowed program (e.g. `brew upgrade kubectl`) changes its path or cdhash. Unlock
   the profile again to pick up the new one.
 - A PID could in theory be reused between the scan and the signature check (milliseconds, and the
@@ -134,17 +162,17 @@ ramvault lock                  # zeroize + unmount now (or: ramvault lock talos)
 Inside a profile: `RAMVAULT_PROFILE`, `RAMVAULT_DIR` (where its files will appear) and
 `RAMVAULT_BIN` (this binary) are set. Re-unlocking a profile replaces its files and restarts its timers.
 
-Try it with the demo profile (dummy file, readable only by `/bin/cat`):
+Try it with the demo profile (dummy file, readable only by `/sbin/md5`):
 
 ```bash
 RAMVAULT_IDLE=10 ramvault unlock examples/profiles/demo
 ```
 
 ```bash
-cat ~/.ramvault/demo/demo.txt
+md5 ~/.ramvault/demo/demo.txt
 ```
 
-The second command prints the dummy line; `head ~/.ramvault/demo/demo.txt` fails with
+The second command prints the file's MD5; `cat ~/.ramvault/demo/demo.txt` fails with
 "Permission denied". After 10 s without an allowed read, `ramvault status` says
 `locked (vault not running)`.
 
@@ -157,9 +185,9 @@ The second command prints the dummy line; `head ~/.ramvault/demo/demo.txt` fails
 ## Verified on panna (macOS 27.2, macFUSE 5.5.0)
 
 - Demo profile unlocks via launchd; `cat` reads it; `eval "$(ramvault env)"` points at it.
-- Caller check: `cat` allowed (also a 6 KB file); `head`, `python3` refused, including right
-  after `cat` read the file (no FSKit cache leak); `cat` refused while a disallowed process holds
-  the file open.
+- Caller check: the allowed program reads (also a 6 KB file); `head`, `python3` refused, including
+  right after an allowed read (no FSKit cache leak); the allowed program is refused while a
+  disallowed process holds the file open.
 - `allow --any` profile next to a checked one: `cat`, `head`, `python3` all read it; 3.0 ms per
   `cat` against 13.8 ms for the checked profile; its opens keep it alive while the checked one
   expires; `allow` of a script, no readers declared, or both modes all fail with a clear message.

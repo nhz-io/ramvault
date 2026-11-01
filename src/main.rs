@@ -11,7 +11,7 @@ mod vault;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use proto::{Request, call, valid_name};
+use proto::{Request, call, call_keep, valid_name};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -222,16 +222,16 @@ fn unlock(args: &[String]) -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut failed = false;
     for (name, path) in profiles {
-        let token = call(
+        // Held until commit/abort: if this process dies, the vault drops the staged profile.
+        let (begun, _staging) = call_keep(
             &Request::Begin {
                 profile: name.clone(),
                 idle,
                 max,
             },
             None,
-        )?
-        .token
-        .context("no token")?;
+        )?;
+        let token = begun.token.context("no token")?;
         let st = Command::new(&path)
             .env("RAMVAULT_TOKEN", &token)
             .env("RAMVAULT_PROFILE", &name)

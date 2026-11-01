@@ -56,7 +56,7 @@ static int op_open(const char *path, struct fuse_file_info *fi) {
     struct fuse_context *ctx = fuse_get_context();
     int rc = rv_open(path, fi->flags, ctx->pid, ctx->uid);
     if (rc) return rc;
-    fi->direct_io = 1;   // ask for no page cache (FSKit may still cache; opens always reach us)
+    fi->direct_io = 1;   // ask for no page cache (FSKit caches anyway; opens always reach us)
     fi->keep_cache = 0;
     return 0;
 }
