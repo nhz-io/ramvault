@@ -274,7 +274,9 @@ impl Daemon {
                         files: BTreeMap::new(),
                         env: vec![],
                         allow: vec![],
+                        any_reader: false,
                         unlocked: now,
+                        unlocked_wall: std::time::SystemTime::now(),
                         last_use: now,
                         idle: Duration::from_secs(idle),
                         max: Duration::from_secs(max),
@@ -323,6 +325,10 @@ impl Daemon {
                 }
                 Ok(Response::ok())
             }
+            Request::AllowAny { token } => {
+                staged(&mut v, &token)?.any_reader = true;
+                Ok(Response::ok())
+            }
             Request::Commit { token } => {
                 let p = v
                     .staging
@@ -341,11 +347,16 @@ impl Daemon {
                         p.name
                     );
                 }
-                if p.allow.is_empty() {
-                    bail!(
-                        "profile {} allows no programs (`ramvault allow <program>`)",
+                match (p.any_reader, p.allow.is_empty()) {
+                    (false, true) => bail!(
+                        "profile {} declares no readers: `ramvault allow <program>…`, or `ramvault allow --any` for no check",
                         p.name
-                    );
+                    ),
+                    (true, false) => bail!(
+                        "profile {} uses both `allow --any` and `allow <program>`; pick one",
+                        p.name
+                    ),
+                    _ => {}
                 }
                 log.record(
                     "unlock",
@@ -355,6 +366,7 @@ impl Daemon {
                         "idle": p.idle.as_secs(),
                         "max": p.max.as_secs(),
                         "allow": p.allow,
+                        "any_reader": p.any_reader,
                     }),
                 );
                 let status = p.status(Instant::now());

@@ -7,11 +7,10 @@
 #include <errno.h>
 #include <stdint.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 
 // Implemented in Rust (src/fs.rs). Return 0 / byte count, or -errno.
-extern int rv_getattr(const char *path, uint32_t *mode, uint64_t *size);
+extern int rv_getattr(const char *path, uint32_t *mode, uint64_t *size, struct timespec *mtime);
 extern int rv_readdir(const char *path, void *ctx, void (*add)(void *ctx, const char *name));
 extern int rv_open(const char *path, int flags, int32_t pid, uint32_t uid);
 extern int rv_read(const char *path, int32_t pid, uint32_t uid, char *buf, size_t size, int64_t off);
@@ -22,7 +21,8 @@ static int op_getattr(const char *path, struct stat *st, struct fuse_file_info *
     (void)fi;
     uint32_t mode = 0;
     uint64_t size = 0;
-    int rc = rv_getattr(path, &mode, &size);
+    struct timespec mtime = {0, 0};
+    int rc = rv_getattr(path, &mode, &size, &mtime);
     if (rc) return rc;
     memset(st, 0, sizeof *st);
     st->st_mode = mode;
@@ -31,13 +31,10 @@ static int op_getattr(const char *path, struct stat *st, struct fuse_file_info *
     st->st_uid = getuid();
     st->st_gid = getgid();
     st->st_blksize = 4096;
-    if (S_ISREG(mode)) {
-        // A new mtime on every lookup: FSKit then drops cached pages on open, so every
-        // open is followed by a read that reaches us (where the reader is identified).
-        struct timespec now;
-        clock_gettime(CLOCK_REALTIME, &now);
-        st->st_mtimespec = st->st_ctimespec = now;
-    }
+    // Rust picks the mtime: "now" for files whose readers are checked (FSKit then drops its
+    // cache on open, so every open is followed by a read that reaches the check), the unlock
+    // time otherwise (FSKit may cache).
+    st->st_mtimespec = st->st_ctimespec = mtime;
     return 0;
 }
 

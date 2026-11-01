@@ -5,7 +5,8 @@ memory and ejects itself when you stop using it.
 
 `ramvault unlock talos` runs a *profile* (your script) that mints or decrypts credentials and pipes
 them into the vault. Tools then read plain files such as `~/.ramvault/talos/talosconfig`, with no
-Touch ID prompt per read, and only the programs the profile allows (e.g. `talosctl`) can read them. After `RAMVAULT_IDLE` seconds without a read (default 1 h), or
+Touch ID prompt per read, and only the programs the profile allows (e.g. `talosctl`) can read them
+(or, per profile with `ramvault allow --any`, any of your processes, faster and without the check). After `RAMVAULT_IDLE` seconds without a read (default 1 h), or
 `RAMVAULT_MAX` seconds after unlock (default and hard cap 24 h), the vault zeroizes its memory,
 unmounts and exits. Nothing runs while it's locked.
 
@@ -23,14 +24,25 @@ and least-privilege anyway (e.g. a 24 h `os:reader` talosconfig).
 | Process | `ramvault serve`, started on demand by `unlock` via `launchctl bootstrap gui/<uid>` of `~/Library/Application Support/ramvault/io.nhz.ramvault.plist`, deliberately **not** in `~/Library/LaunchAgents`, so it never starts at login. On exit it `bootout`s itself. |
 | Filesystem | macFUSE 5 with its **FSKit** backend (user space, no kernel extension), read-only, `nobrowse`, mounted at `~/.ramvault`. Tree: `/<profile>/<file>`, dirs 0500, files 0400, owner = you. |
 | FUSE glue | ~110 lines of C (`src/shim.c`) over macFUSE's libfuse3; every operation is answered in Rust (`src/fs.rs`). Not the `fuser` crate: it needs a `/dev/macfuse` file descriptor, which only the kext backend has. FSKit talks over its own channel that only libfuse drives. |
-| Delivery | `unlock` asks the vault for a one-time token and runs the profile with `RAMVAULT_TOKEN` etc. The profile calls `ramvault put <name>` (stdin → control socket → vault memory), `ramvault export KEY <name>`, `ramvault allow <program>`. Exit 0 commits atomically; anything else discards. Files are write-once. |
-| Caller check | On every read, all processes holding the file open (yours only) are found by scanning open descriptors; each must be an allowed program, or the read fails with `EACCES`. See below. |
+| Delivery | `unlock` asks the vault for a one-time token and runs the profile with `RAMVAULT_TOKEN` etc. The profile calls `ramvault put <name>` (stdin → control socket → vault memory), `ramvault export KEY <name>`, `ramvault allow <program>…` or `ramvault allow --any`. Exit 0 commits atomically; anything else discards. Files are write-once. |
+| Caller check | Per profile. With `allow <program>…`: on every read, all processes holding the file open (yours only) are found by scanning open descriptors; each must be an allowed program, or the read fails with `EACCES`. With `allow --any`: off. See below. |
 | Memory | Each file is one exact-size buffer, `mlock`ed (no swap), zeroized (`zeroize`) on expiry, lock, re-unlock and exit. Core dumps off (`RLIMIT_CORE=0`), `PT_DENY_ATTACH`. |
-| Timers | Per profile: idle since the last allowed read, max since unlock. The vault exits when the last profile is gone (or 30 s after start with none). |
+| Timers | Per profile: idle since the last allowed read (with `--any`: the last open), max since unlock. The vault exits when the last profile is gone (or 30 s after start with none). |
 | Control | `~/Library/Caches/ramvault/ctl.sock` (0600, dir 0700, peer uid checked). JSON lines. |
 | Audit log | `~/Library/Logs/ramvault.log` (0600), JSON lines: start, unlock (file names, sizes, allowed programs), every open, every read / deny with the reading processes (pid, path, signing id, verdict), expire, lock, stop. Never contents. |
 
 ### Who can read
+
+Each profile declares its readers, one of:
+
+- `ramvault allow talosctl kubectl`: only these programs (checked on every read, below);
+- `ramvault allow --any`: any process running as you. No scan and no signature checks, and FSKit
+  may cache contents, so reads are faster (about 3 ms per `cat` on panna, against about 14 ms
+  with the check).
+
+A profile that declares neither, or both, fails to unlock.
+
+#### How readers are checked
 
 macFUSE's FSKit backend doesn't say which process is calling: FSKit hands the filesystem the
 operation without caller credentials, so the PID is always 0. Only the kext backend reports PIDs,
@@ -52,6 +64,14 @@ and that needs Reduced Security on Apple Silicon. ramvault identifies readers an
 4. The read is allowed only if there is at least one holder and **all** holders are allowed.
    With no holder (e.g. memory-mapped access) it's refused.
 
+`allow` refuses:
+
+- **scripts** (`#!`): the process reading would be the interpreter (`/bin/sh`, `python3`), and
+  allowing that would let every script read; allow the program the script runs instead;
+- **programs without a valid code signature**: there would be nothing to verify a reader against.
+  On Apple Silicon every native program is signed (at least ad-hoc), so this only rules out
+  unsigned Intel binaries under Rosetta.
+
 Limits, by design or by FSKit:
 
 - Opening and `stat` work for any of your processes; only contents are protected.
@@ -59,7 +79,7 @@ Limits, by design or by FSKit:
   the profile again to pick up the new one.
 - A PID could in theory be reused between the scan and the signature check (milliseconds, and the
   newcomer would have to be your own process holding the same file open).
-- A check takes about 10–35 ms per read.
+- A check takes about 10–35 ms per read (`allow --any` skips it).
 
 Also:
 
@@ -130,7 +150,7 @@ The second command prints the dummy line; `head ~/.ramvault/demo/demo.txt` fails
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `RAMVAULT_IDLE` | 3600 | seconds without an allowed read before a profile is dropped (read at `unlock`) |
+| `RAMVAULT_IDLE` | 3600 | seconds without an allowed read (`--any`: an open) before a profile is dropped (read at `unlock`) |
 | `RAMVAULT_MAX` | 86400 | seconds after unlock before a profile is dropped; capped at 86400 |
 | `RAMVAULT_FUSE_OPTIONS` | | extra macFUSE mount options, comma-separated (read when the vault starts) |
 
@@ -140,6 +160,9 @@ The second command prints the dummy line; `head ~/.ramvault/demo/demo.txt` fails
 - Caller check: `cat` allowed (also a 6 KB file); `head`, `python3` refused, including right
   after `cat` read the file (no FSKit cache leak); `cat` refused while a disallowed process holds
   the file open.
+- `allow --any` profile next to a checked one: `cat`, `head`, `python3` all read it; 3.0 ms per
+  `cat` against 13.8 ms for the checked profile; its opens keep it alive while the checked one
+  expires; `allow` of a script, no readers declared, or both modes all fail with a clear message.
 - Idle eject: with `RAMVAULT_IDLE=4..6` the profile expires, the volume unmounts, the process exits
   and the launchd job is gone; an allowed read resets the timer.
 - Nothing on disk: a random marker delivered by a profile and read back was not found in

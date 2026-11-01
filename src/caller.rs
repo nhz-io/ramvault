@@ -71,8 +71,17 @@ pub struct Identity {
 
 impl Identity {
     /// A program a profile allows, resolved now: symlinks followed, signature read.
+    /// Refuses scripts (the reader would be the interpreter) and code without a valid signature
+    /// (nothing to verify a reader against).
     pub fn of_program(path: &Path) -> Result<Identity> {
         let path = std::fs::canonicalize(path).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+        if is_script(&path) {
+            bail!(
+                "{} is a script: the process reading would be its interpreter, which can't be \
+                 allowed safely; allow the program the script runs (e.g. kubectl) instead",
+                path.display()
+            );
+        }
         let mut id = Identity {
             path: path.clone(),
             ..Default::default()
@@ -81,12 +90,18 @@ impl Identity {
         let mut code: SecCodeRef = std::ptr::null();
         let rc = unsafe { SecStaticCodeCreateWithPath(url.as_concrete_TypeRef(), 0, &mut code) };
         if rc != 0 {
-            return Ok(id); // unsigned: path match only
+            bail!("{}: not a code-signed program", path.display());
         }
         let code = Owned(code);
         id.valid = unsafe { SecStaticCodeCheckValidity(code.0, 0, std::ptr::null()) } == 0;
         signing_info(code.0, &mut id);
         id.requirement = requirement_for(code.0, &id);
+        if id.requirement.is_none() {
+            bail!(
+                "{}: no valid code signature, so readers can't be verified against it",
+                path.display()
+            );
+        }
         Ok(id)
     }
 
@@ -108,18 +123,16 @@ impl Identity {
     }
 
     /// Is the process `pid` (whose identity is `running`) this allowed program?
-    /// Same resolved path, and — if the program was signed at unlock — its running code satisfies
-    /// the requirement recorded then (Apple-signed + identifier, Developer ID team + identifier,
+    /// Same resolved path, and its running code satisfies the requirement recorded at unlock (Apple-signed + identifier, Developer ID team + identifier,
     /// or for ad-hoc code the exact cdhash). Requirements are checked against the running code,
     /// so universal binaries match whichever slice is executing.
     pub fn admits(&self, pid: i32, running: &Identity) -> bool {
         if self.path != running.path {
             return false;
         }
-        match &self.requirement {
-            None => self.signing_id.is_none(), // unsigned at unlock: path only
-            Some(req) => satisfies(pid, req),
-        }
+        self.requirement
+            .as_deref()
+            .is_some_and(|req| satisfies(pid, req))
     }
 }
 
@@ -205,6 +218,14 @@ fn signing_info(code: SecCodeRef, id: &mut Identity) {
         .map(|d| d.bytes().iter().map(|b| format!("{b:02x}")).collect());
 }
 
+fn is_script(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 2];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .is_ok_and(|()| &head == b"#!")
+}
+
 fn pid_path(pid: i32) -> Result<PathBuf> {
     let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
@@ -282,6 +303,31 @@ mod tests {
         assert!(!check(&allowed, &mut spawn("/bin/sleep", &["5"])));
         allowed.requirement = Some("cdhash H\"0000000000000000000000000000000000000000\"".into());
         assert!(!check(&allowed, &mut spawn("/bin/sleep", &["5"])));
+    }
+
+    #[test]
+    fn scripts_refused() {
+        let dir = std::env::temp_dir().join(format!("ramvault-script-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("helper.sh");
+        std::fs::write(&f, b"#!/bin/sh\ncat \"$1\"\n").unwrap();
+        let e = Identity::of_program(&f).unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(e.to_string().contains("is a script"), "{e}");
+    }
+
+    #[test]
+    fn unsigned_refused() {
+        let dir = std::env::temp_dir().join(format!("ramvault-unsigned-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("prog");
+        std::fs::write(&f, b"\x7fELF not a mach-o").unwrap();
+        let e = Identity::of_program(&f).unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            e.to_string().contains("code-signed") || e.to_string().contains("signature"),
+            "{e}"
+        );
     }
 
     #[test]

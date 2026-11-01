@@ -5,7 +5,7 @@ use crate::proto::ProfileStatus;
 use crate::secret::Secret;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub struct File {
     pub data: Secret,
@@ -16,7 +16,11 @@ pub struct Profile {
     pub files: BTreeMap<String, File>,
     pub env: Vec<(String, String)>,
     pub allow: Vec<Identity>,
+    /// `ramvault allow --any`: no reader check for this profile.
+    pub any_reader: bool,
     pub unlocked: Instant,
+    /// Wall-clock unlock time, used as the files' mtime when FSKit may cache them.
+    pub unlocked_wall: SystemTime,
     pub last_use: Instant,
     pub idle: Duration,
     pub max: Duration,
@@ -47,6 +51,7 @@ impl Profile {
                 .collect(),
             env: self.env.clone(),
             allow: self.allow.iter().map(|a| a.path.clone()).collect(),
+            any_reader: self.any_reader,
             idle_left: left(self.last_use, self.idle),
             max_left: left(self.unlocked, self.max),
         }
@@ -87,7 +92,9 @@ mod tests {
             files: BTreeMap::new(),
             env: vec![],
             allow: vec![],
+            any_reader: false,
             unlocked: now,
+            unlocked_wall: SystemTime::now(),
             last_use: now,
             idle: Duration::from_secs(idle),
             max: Duration::from_secs(max),

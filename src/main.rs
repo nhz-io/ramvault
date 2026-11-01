@@ -46,9 +46,12 @@ enum Cmd {
     Put { name: String },
     /// [inside a profile] Declare env KEY pointing at file NAME of this profile.
     Export { key: String, name: String },
-    /// [inside a profile] Allow PROGRAMs (name in PATH or path) to read this profile's files.
+    /// [inside a profile] Allow PROGRAMs (name in PATH or path) to read this profile's files,
+    /// or `--any` to switch the reader check off for this profile (faster, any of your processes).
     Allow {
-        #[arg(required = true)]
+        #[arg(long, conflicts_with = "programs")]
+        any: bool,
+        #[arg(required_unless_present = "any")]
         programs: Vec<String>,
     },
 
@@ -104,7 +107,16 @@ fn run(cli: Cli) -> Result<()> {
             call(&Request::Put { token, name, len }, Some(&data))?;
             Ok(())
         }
-        Cmd::Allow { programs } => {
+        Cmd::Allow { any: true, .. } => {
+            call(
+                &Request::AllowAny {
+                    token: profile_token()?,
+                },
+                None,
+            )?;
+            Ok(())
+        }
+        Cmd::Allow { programs, .. } => {
             let token = profile_token()?;
             for p in programs {
                 // Resolved here, with the profile's PATH; the vault reads the signature.
@@ -285,6 +297,9 @@ fn status() -> Result<()> {
         }
         for (k, v) in &p.env {
             println!("  env    {k}={v}");
+        }
+        if p.any_reader {
+            println!("  allow  any process of this user (no reader check)");
         }
         for a in &p.allow {
             println!("  allow  {}", a.display());
