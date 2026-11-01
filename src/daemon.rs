@@ -34,6 +34,12 @@ static DAEMON: OnceLock<Daemon> = OnceLock::new();
 pub fn serve() -> Result<()> {
     harden();
     let signals = block_signals();
+    if crate::launchd::running_as_job() {
+        // launchd appends our stderr to ramvault.err.log; keep only this run's errors (the
+        // unlocking CLI shows them if we fail).
+        unsafe { libc::ftruncate(2, 0) };
+    }
+    crate::paths::ensure_state_dir()?;
 
     let log = AuditLog::open(&crate::paths::audit_log()?)?;
     let shared = Arc::new(Shared {
@@ -49,21 +55,17 @@ pub fn serve() -> Result<()> {
             mount.display()
         )
     })?;
-    // FSKit attaches the volume asynchronously; answer `unlock` only once it is really there.
-    wait_mounted(&mount).inspect_err(|_| crate::fs::stop())?;
-    std::fs::write(
-        crate::paths::mount_record()?,
-        mount.as_os_str().as_encoded_bytes(),
-    )?;
-
-    let socket = crate::paths::socket()?;
-    let dir = socket.parent().unwrap();
-    std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    let _ = std::fs::remove_file(&socket);
-    let listener =
-        UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    // Anything failing from here on must not leave the volume mounted.
+    let (socket, listener) = match finish_start(&mount) {
+        Ok(x) => x,
+        Err(e) => {
+            crate::fs::stop();
+            if crate::mountpoint::wait_gone(&mount, Duration::from_secs(5)) {
+                let _ = std::fs::remove_file(crate::paths::mount_record()?);
+            }
+            return Err(e);
+        }
+    };
 
     shared
         .log
@@ -92,6 +94,22 @@ pub fn serve() -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// After mounting: wait for the volume, record it, open the control socket.
+fn finish_start(mount: &std::path::Path) -> Result<(PathBuf, UnixListener)> {
+    // FSKit attaches the volume asynchronously; answer `unlock` only once it is really there.
+    wait_mounted(mount)?;
+    std::fs::write(
+        crate::paths::mount_record()?,
+        mount.as_os_str().as_encoded_bytes(),
+    )?;
+    let socket = crate::paths::socket()?;
+    let _ = std::fs::remove_file(&socket);
+    let listener =
+        UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    Ok((socket, listener))
 }
 
 fn wait_mounted(mount: &std::path::Path) -> Result<()> {

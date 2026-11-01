@@ -25,9 +25,9 @@ and least-privilege anyway (e.g. a 24 h `os:reader` talosconfig).
 | FUSE glue | ~110 lines of C (`src/shim.c`) over macFUSE's libfuse3; every operation is answered in Rust (`src/fs.rs`). Not the `fuser` crate: it needs a `/dev/macfuse` file descriptor, which only the kext backend has. FSKit talks over its own channel that only libfuse drives. |
 | Delivery | `unlock` asks the vault for a one-time token and runs the profile with `RAMVAULT_TOKEN` etc. The profile calls `ramvault put <name>` (stdin → control socket → vault memory), `ramvault export KEY <name>`. Exit 0 commits atomically; anything else discards. Files are write-once. |
 | Who can read | Any process running as you; macFUSE refuses other users. There is no per-program check (see below). |
-| Memory | ramvault keeps each file in one exact-size buffer, `mlock`ed (no swap) and zeroized (`zeroize`) on expiry, lock, re-unlock and exit; delivery doesn't copy it anywhere else in ramvault. Core dumps off (`RLIMIT_CORE=0`), `PT_DENY_ATTACH`. **Not wiped by ramvault:** copies made by libfuse while answering a read (its reply buffers, freed without wiping, gone when the vault exits), by FSKit/macFUSE in their own processes (their cache, dropped on unmount), and by every program that reads the file. |
+| Memory | ramvault keeps each file in one exact-size buffer, `mlock`ed (no swap; if the lock fails the file is refused and `unlock` fails) and zeroized (`zeroize`) on expiry, lock, re-unlock and exit; delivery doesn't copy it anywhere else in ramvault. Core dumps off (`RLIMIT_CORE=0`), `PT_DENY_ATTACH`. **Not wiped by ramvault:** copies made by libfuse while answering a read (its reply buffers, freed without wiping, gone when the vault exits), by FSKit/macFUSE in their own processes (their cache, dropped on unmount), and by every program that reads the file. |
 | Timers | Per profile: idle since the last open of one of its files, max since unlock. The vault exits when the last profile is gone (or 30 s after start with none). |
-| Control | `~/Library/Caches/ramvault/ctl.sock` (0600, dir 0700, peer uid checked). JSON lines. |
+| State | `~/Library/Application Support/ramvault/` (0700): plist, control socket `ctl.sock` (0600, peer uid checked, JSON lines), start lock, record of where the vault mounted. Not in `~/Library/Caches`, which cleanup tools purge. |
 | Audit log | `~/Library/Logs/ramvault.log` (0600), JSON lines: start, unlock (file names and sizes), every open, expire, lock, abandon (interrupted or hung unlock), stop. Never contents. Rotated to `ramvault.log.1` at 1 MiB, so at most about 2 MiB on disk. |
 
 ### What it protects against, and what not
@@ -49,6 +49,12 @@ Notes:
   the vault keeps a staged profile only while the unlocking command's connection is open, and
   at most 10 minutes (a hung profile).
 - Several `unlock`s at once are fine: starting the vault is serialized by a lock file.
+- Starting the vault has no timeout: the first mount can wait on a macOS prompt (enable the
+  file system extension) for as long as you take; `unlock` says what it's waiting for. If the
+  vault exits instead, `unlock` shows its error (`~/Library/Logs/ramvault.err.log`, which holds
+  only the latest run).
+- `ramvault env <name>` fails, naming it, if that profile isn't unlocked, so
+  `eval "$(ramvault env …)"` can't silently leave tools on another config.
 - `ramvault lock <name>` fails, naming it, if that profile isn't unlocked.
 - A vault that died without unmounting (killed, crashed) leaves a dead mount; the next start
   force-unmounts it.
@@ -149,7 +155,7 @@ else, or another filesystem already mounted there.
 - Idle eject: with `RAMVAULT_IDLE=4..6` the profile expires, the volume unmounts, the process exits
   and the launchd job is gone; an open resets the timer.
 - Nothing on disk: a random marker delivered by a profile and read back was not found in
-  `~/Library/Logs`, `~/Library/Caches/ramvault`, `~/Library/Application Support/ramvault`,
+  `~/Library/Logs`, `~/Library/Application Support/ramvault`,
   `~/.config`, `/private/tmp`, `$TMPDIR`, before or after lock.
 
 ## Build from source

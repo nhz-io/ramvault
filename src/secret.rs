@@ -1,4 +1,4 @@
-//! File contents held only in memory: mlock'd (kept out of swap), zeroized on drop.
+//! File contents held only in memory: mlock'd (kept out of swap, or refused), zeroized on drop.
 
 use std::io::Read;
 use zeroize::Zeroize;
@@ -8,19 +8,26 @@ pub const MAX_LEN: usize = 1 << 20;
 
 pub struct Secret {
     buf: Vec<u8>,
-    locked: bool,
 }
 
 impl Secret {
-    /// Takes ownership of `buf` without copying it, so no stray copy is left behind.
-    pub fn new(buf: Vec<u8>) -> Secret {
-        let locked = !buf.is_empty() && unsafe { libc::mlock(buf.as_ptr().cast(), buf.len()) } == 0;
-        Secret { buf, locked }
+    /// Takes ownership of `buf` without copying it, so no stray copy is left behind. Fails
+    /// (wiping `buf`) if the memory can't be locked: a swappable copy is refused, not risked.
+    pub fn new(mut buf: Vec<u8>) -> std::io::Result<Secret> {
+        if !buf.is_empty() && unsafe { libc::mlock(buf.as_ptr().cast(), buf.len()) } != 0 {
+            let e = std::io::Error::last_os_error();
+            buf.zeroize();
+            return Err(std::io::Error::other(format!(
+                "can't lock {} bytes in memory (kept out of swap): {e}",
+                buf.capacity()
+            )));
+        }
+        Ok(Secret { buf })
     }
 
     /// Reads exactly `len` bytes into a buffer allocated once (no reallocation copies).
     pub fn read_exact(r: &mut impl Read, len: usize) -> std::io::Result<Secret> {
-        let mut s = Secret::new(vec![0u8; len]);
+        let mut s = Secret::new(vec![0u8; len])?;
         if let Err(e) = r.read_exact(&mut s.buf) {
             return Err(e); // `s` zeroizes on drop
         }
@@ -55,7 +62,7 @@ impl Secret {
         let mut exact = vec![0u8; n];
         exact.copy_from_slice(&buf[..n]);
         buf.zeroize();
-        Ok(Secret::new(exact))
+        Secret::new(exact)
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -70,7 +77,7 @@ impl Secret {
 impl Drop for Secret {
     fn drop(&mut self) {
         self.buf.zeroize();
-        if self.locked {
+        if self.buf.capacity() > 0 {
             unsafe { libc::munlock(self.buf.as_ptr().cast(), self.buf.capacity()) };
         }
     }

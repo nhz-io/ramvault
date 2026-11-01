@@ -58,12 +58,9 @@ fn main() {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
-        Cmd::Serve => daemon::serve().inspect_err(|_| {
-            if launchd::running_as_job() {
-                let _ = std::fs::remove_file(paths::socket().unwrap_or_default());
-                launchd::stop(); // don't stay loaded after a failed start
-            }
-        }),
+        // On failure the vault has already unmounted; the unlocking CLI sees it exit and
+        // reports the error. (No self-bootout: launchd's SIGTERM is blocked here.)
+        Cmd::Serve => daemon::serve(),
         Cmd::Unlock { profiles } => unlock(&profiles),
         Cmd::Lock { profiles } => {
             if call(&Request::Status, None).is_err() {
@@ -75,11 +72,25 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Status => status(),
         Cmd::Env { profiles } => {
-            let Ok(resp) = call(&Request::Status, None) else {
-                return Ok(());
-            };
-            for p in resp
-                .profiles
+            let unlocked = call(&Request::Status, None)
+                .map(|r| r.profiles)
+                .unwrap_or_default();
+            // A silent empty output would let `eval` leave tools on some other config.
+            let missing: Vec<&String> = profiles
+                .iter()
+                .filter(|n| !unlocked.iter().any(|p| &p.name == *n))
+                .collect();
+            if !missing.is_empty() {
+                bail!(
+                    "not unlocked: {}",
+                    missing
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            for p in unlocked
                 .iter()
                 .filter(|p| profiles.is_empty() || profiles.contains(&p.name))
             {
@@ -163,25 +174,49 @@ fn ensure_vault() -> Result<()> {
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
         .collect();
     launchd::start(&env)?;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < deadline {
+    // No deadline: the first mount can wait on a macOS prompt for as long as the user takes.
+    // Wait while the vault process lives; if it exits, show why. Ctrl-C stops waiting (a vault
+    // that mounts later exits by itself after 30 s with no profiles).
+    let started = Instant::now();
+    let mut told = false;
+    loop {
         if call(&Request::Status, None).is_ok() {
             return Ok(());
         }
+        let elapsed = started.elapsed();
+        if elapsed > Duration::from_secs(2) && !launchd::is_running() {
+            launchd::stop();
+            let log = paths::stderr_log()?;
+            let tail = std::fs::read_to_string(&log).unwrap_or_default();
+            let tail: Vec<&str> = tail.lines().rev().take(5).collect();
+            let why: String = tail.into_iter().rev().collect::<Vec<_>>().join("\n  ");
+            bail!(
+                "the vault exited before it was ready:\n  {}\n(full log: {}){}",
+                if why.is_empty() { "(no output)" } else { &why },
+                log.display(),
+                if why.contains("not enabled") {
+                    FSKIT_HINT
+                } else {
+                    ""
+                }
+            );
+        }
+        if !told && elapsed > Duration::from_secs(3) {
+            eprintln!("ramvault: waiting for the vault to mount…{FSKIT_HINT}");
+            told = true;
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
-    launchd::stop();
-    bail!(
-        "vault did not start; see {}",
-        paths::stderr_log()?.display()
-    )
 }
+
+const FSKIT_HINT: &str = "\nIf macOS asks about a file system extension: System Settings → General → Login Items & \
+Extensions → File System Extensions → (i) → view By Category → enable macFUSE and macFUSE (local).";
 
 /// Exclusive lock on `start.lock`, released when the returned file is dropped.
 fn start_lock() -> Result<std::fs::File> {
     use std::os::fd::AsRawFd;
+    paths::ensure_state_dir()?;
     let path = paths::start_lock()?;
-    std::fs::create_dir_all(path.parent().unwrap())?;
     let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)

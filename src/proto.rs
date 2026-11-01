@@ -1,4 +1,4 @@
-//! Control protocol over ~/Library/Caches/ramvault/ctl.sock: one JSON request line, then
+//! Control protocol over ~/Library/Application Support/ramvault/ctl.sock: one JSON request line, then
 //! (for `Put` only) exactly `len` raw bytes, then one JSON response line.
 
 use crate::secret::Secret;
