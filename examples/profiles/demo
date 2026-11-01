@@ -1,0 +1,11 @@
+#!/bin/sh
+# Demo profile: one dummy file plus an env var pointing at it, readable only by /bin/cat.
+# Install: cp examples/profiles/demo ~/.config/ramvault/profiles/  then  ramvault unlock demo
+set -eu
+rv=${RAMVAULT_BIN:-ramvault}
+
+# Contents go from this pipe straight into the vault's memory; nothing touches the disk.
+printf 'not-a-real-secret %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | "$rv" put demo.txt
+
+"$rv" export RAMVAULT_DEMO demo.txt
+"$rv" allow /bin/cat
