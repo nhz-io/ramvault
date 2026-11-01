@@ -43,8 +43,11 @@ stop concurrent readers or malware simply running the allowed tool (`kubectl con
 
 Notes:
 
-- FSKit may serve repeated reads from its own cache, but every open reaches ramvault, so idle
-  time counts from the last open.
+- Idle time counts from the last open that reaches ramvault. FSKit serves repeated reads from
+  its own cache, and while one process holds a file open it doesn't forward other processes'
+  opens of that file either: those aren't logged and don't reset the idle timer, so a profile
+  can expire while a long-running tool keeps its file open. Tools like `kubectl` and
+  `talosctl` open, read and close, so each use counts.
 - An interrupted `unlock` (Ctrl-C, closed terminal) drops the half-delivered profile at once:
   the vault keeps a staged profile only while the unlocking command's connection is open, and
   at most 10 minutes (a hung profile).
@@ -126,8 +129,6 @@ cat ~/.ramvault/demo/demo.txt
 The second command prints the dummy line. After 10 s without an open, `ramvault status` says
 `locked (vault not running)`.
 
-| Variable | Default | Meaning |
-|---|---|---|
 ### Settings
 
 Optional `~/.config/ramvault/config.toml`; an environment variable overrides each key for one run
@@ -156,9 +157,12 @@ else, or another filesystem already mounted there.
 
 - Demo profile unlocks via launchd; `cat` reads it; `eval "$(ramvault env)"` points at it.
 - Interrupted unlock: Ctrl-C during a profile drops the staged profile (`abandon` in the log).
-- Crash recovery: after `kill -9` of the vault, the next unlock clears the dead mount and works.
-- Idle eject: with `RAMVAULT_IDLE=4..6` the profile expires, the volume unmounts, the process exits
-  and the launchd job is gone; an open resets the timer.
+- Crash recovery: after `kill -9` of the vault, the next unlock clears the dead mount and works;
+  a macFUSE volume at the mount point that isn't the recorded one is refused.
+- Idle eject: with `RAMVAULT_IDLE=3..6` the profile expires, the volume unmounts and the process
+  exits (the launchd job stays loaded, not running, until the next unlock); an open resets the
+  timer.
+- Lock then immediate unlock, repeated: each cycle starts a fresh vault and reads work.
 - Nothing on disk: a random marker delivered by a profile and read back was not found in
   `~/Library/Logs`, `~/Library/Application Support/ramvault`,
   `~/.config`, `/private/tmp`, `$TMPDIR`, before or after lock.
