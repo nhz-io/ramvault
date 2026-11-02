@@ -77,7 +77,7 @@ Notes:
 
 ## Install
 
-Requires macFUSE 5 with its FSKit module enabled (one time):
+Requires macFUSE 5 with its FSKit module enabled (one time; the cask below installs macFUSE too, the switch is yours):
 
 ```bash
 brew install --cask macfuse
@@ -88,7 +88,13 @@ view to **By Category** and enable **macFUSE** and **macFUSE (local)**. In the "
 view the toggles ignore clicks ([macfuse/macfuse#1194](https://github.com/macfuse/macfuse/issues/1194)),
 and mounts fail with "File system extension not enabled" until both are on.
 
-Then build (needs Command Line Tools, Rust, and `brew install pkgconf`):
+Then install ramvault (Apple Silicon; the cask also pulls in macFUSE):
+
+```bash
+brew install --cask nhz-io/tap/ramvault
+```
+
+Or build it yourself (needs Command Line Tools, Rust, and `brew install pkgconf`):
 
 ```bash
 cargo install --path . --root ~/.local
